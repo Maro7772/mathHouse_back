@@ -1,0 +1,883 @@
+import { Request, Response } from "express";
+import { randomUUID } from "crypto";
+import { db } from "../../models/connection";
+import { sessions, sessionLessons, sessionUsers, sessionGroups, sessionAttendance, sessionStudentPdfs } from "../../models/schema/admin/Session";
+import { lessons, lessonIdeas, chapters, courses, teachers, sessionRatingQuestions, sessionStudentRatings, sessionStudentQuestionRatings } from "../../models/schema";
+import { groups, groupStudents } from "../../models/schema/admin/Groups";
+import { Student } from "../../models/schema/admin/Student";
+import { eq, and, or, inArray, sql, desc, asc } from "drizzle-orm";
+import { SuccessResponse } from "../../utils/response";
+import { NotFound, UnauthorizedError } from "../../Errors";
+import { BadRequest } from "../../Errors/BadRequest";
+import { validateAndSavePdf, deleteImage } from "../../utils/handleImages";
+import { generateSecureStreamUrl } from "../../drive/services/services";
+import { resolveSessionMaterials, emptySessionMaterials } from "../../utils/sessionMaterials";
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+const getTeacherId = (req: Request): string => {
+    if (!req.user?.id) throw new UnauthorizedError("Not authenticated");
+    return req.user.id;
+};
+
+const resolveIdea = (idea: {
+    id: string;
+    idea: string;
+    ideaOrder: number;
+    pdf: string | null;
+    video: string | null;
+    bunnyGuid: string | null;
+}) => {
+    const { bunnyGuid, video, ...rest } = idea;
+    let videoPayload: { type: "bunny"; streamUrl: string } | { type: "external"; url: string } | null = null;
+    if (bunnyGuid) {
+        videoPayload = { type: "bunny", streamUrl: generateSecureStreamUrl(bunnyGuid) };
+    } else if (video) {
+        videoPayload = { type: "external", url: video };
+    }
+    return { ...rest, video: videoPayload };
+};
+
+/**
+ * Fetches lessons (with ideas) for a list of sessionIds, grouped by sessionId.
+ */
+async function fetchSessionResources(sessionIds: string[]) {
+    if (sessionIds.length === 0) return new Map<string, any[]>();
+
+    // Lessons attached to sessions
+    const sessionLessonsRows = await db
+        .select({
+            sessionId: sessionLessons.sessionId,
+            lesson: {
+                id: lessons.id,
+                name: lessons.name,
+                description: lessons.description,
+                image: lessons.image,
+                order: lessons.order,
+            },
+            chapter: {
+                id: chapters.id,
+                name: chapters.name,
+            },
+            course: {
+                id: courses.id,
+                name: courses.name,
+            },
+        })
+        .from(sessionLessons)
+        .innerJoin(lessons, eq(sessionLessons.lessonId, lessons.id))
+        .leftJoin(chapters, eq(lessons.chapterId, chapters.id))
+        .leftJoin(courses, eq(lessons.courseId, courses.id))
+        .where(inArray(sessionLessons.sessionId, sessionIds));
+
+    // Unique lesson IDs to fetch ideas
+    const lessonIds = Array.from(new Set(sessionLessonsRows.map(r => r.lesson.id)));
+
+    let ideasByLesson = new Map<string, any[]>();
+    if (lessonIds.length > 0) {
+        const ideas = await db
+            .select({
+                id: lessonIdeas.id,
+                lessonId: lessonIdeas.lessonId,
+                idea: lessonIdeas.idea,
+                ideaOrder: lessonIdeas.ideaOrder,
+                pdf: lessonIdeas.pdf,
+                video: lessonIdeas.video,
+                bunnyGuid: lessonIdeas.bunnyGuid,
+            })
+            .from(lessonIdeas)
+            .where(inArray(lessonIdeas.lessonId, lessonIds))
+            .orderBy(asc(lessonIdeas.ideaOrder));
+
+        ideas.forEach(idea => {
+            if (!ideasByLesson.has(idea.lessonId)) ideasByLesson.set(idea.lessonId, []);
+            ideasByLesson.get(idea.lessonId)!.push(resolveIdea(idea));
+        });
+    }
+
+    // Group by sessionId
+    const resourcesBySession = new Map<string, any[]>();
+    sessionLessonsRows.forEach(row => {
+        if (!resourcesBySession.has(row.sessionId)) resourcesBySession.set(row.sessionId, []);
+        const existingLessons = resourcesBySession.get(row.sessionId)!;
+        if (!existingLessons.some((l: any) => l.id === row.lesson.id)) {
+            existingLessons.push({
+                ...row.lesson,
+                chapter: row.chapter,
+                course: row.course,
+                ideas: ideasByLesson.get(row.lesson.id) || [],
+            });
+        }
+    });
+
+    return resourcesBySession;
+}
+
+/**
+ * Fetches student ratings (with question ratings and student info) for a list of sessionIds, grouped by sessionId.
+ */
+async function fetchSessionRatings(sessionIds: string[]) {
+    if (sessionIds.length === 0) return new Map<string, any[]>();
+
+    const ratingsRows = await db
+        .select({
+            id: sessionStudentRatings.id,
+            sessionId: sessionStudentRatings.sessionId,
+            studentId: sessionStudentRatings.studentId,
+            overallRating: sessionStudentRatings.overallRating,
+            generalComment: sessionStudentRatings.generalComment,
+            ratedByTeacherId: sessionStudentRatings.ratedByTeacherId,
+            ratedByAdminId: sessionStudentRatings.ratedByAdminId,
+            createdAt: sessionStudentRatings.createdAt,
+            updatedAt: sessionStudentRatings.updatedAt,
+            studentFirstname: Student.firstname,
+            studentLastname: Student.lastname,
+            studentEmail: Student.email,
+            studentAvatar: Student.avatar,
+            studentPhone: Student.phone,
+        })
+        .from(sessionStudentRatings)
+        .innerJoin(Student, eq(sessionStudentRatings.studentId, Student.id))
+        .where(inArray(sessionStudentRatings.sessionId, sessionIds))
+        .orderBy(desc(sessionStudentRatings.createdAt));
+
+    const ratingIds = ratingsRows.map(r => r.id);
+    const questionRatingsMap = new Map<string, any[]>();
+
+    if (ratingIds.length > 0) {
+        const questionRatings = await db
+            .select({
+                id: sessionStudentQuestionRatings.id,
+                sessionStudentRatingId: sessionStudentQuestionRatings.sessionStudentRatingId,
+                questionId: sessionStudentQuestionRatings.questionId,
+                rating: sessionStudentQuestionRatings.rating,
+                comment: sessionStudentQuestionRatings.comment,
+                questionTitle: sessionRatingQuestions.title,
+                questionCategory: sessionRatingQuestions.category,
+                questionWeight: sessionRatingQuestions.weight,
+            })
+            .from(sessionStudentQuestionRatings)
+            .innerJoin(sessionRatingQuestions, eq(sessionStudentQuestionRatings.questionId, sessionRatingQuestions.id))
+            .where(inArray(sessionStudentQuestionRatings.sessionStudentRatingId, ratingIds));
+
+        questionRatings.forEach(qr => {
+            if (!questionRatingsMap.has(qr.sessionStudentRatingId)) {
+                questionRatingsMap.set(qr.sessionStudentRatingId, []);
+            }
+            questionRatingsMap.get(qr.sessionStudentRatingId)!.push({
+                id: qr.id,
+                questionId: qr.questionId,
+                questionTitle: qr.questionTitle,
+                category: qr.questionCategory,
+                weight: qr.questionWeight,
+                rating: qr.rating,
+                comment: qr.comment,
+            });
+        });
+    }
+
+    const ratingsBySession = new Map<string, any[]>();
+    ratingsRows.forEach(row => {
+        if (!ratingsBySession.has(row.sessionId)) {
+            ratingsBySession.set(row.sessionId, []);
+        }
+        ratingsBySession.get(row.sessionId)!.push({
+            id: row.id,
+            studentId: row.studentId,
+            student: {
+                id: row.studentId,
+                name: `${row.studentFirstname} ${row.studentLastname}`,
+                email: row.studentEmail,
+                avatar: row.studentAvatar,
+                phone: row.studentPhone,
+            },
+            overallRating: Number(row.overallRating),
+            generalComment: row.generalComment,
+            ratedByTeacherId: row.ratedByTeacherId,
+            ratedByAdminId: row.ratedByAdminId,
+            createdAt: row.createdAt,
+            updatedAt: row.updatedAt,
+            questionRatings: questionRatingsMap.get(row.id) || [],
+        });
+    });
+
+    return ratingsBySession;
+}
+
+// ── Controllers ───────────────────────────────────────────────────────────────
+
+export const getAllTeacherSessions = async (req: Request, res: Response) => {
+    const teacherId = getTeacherId(req);
+
+    const [teacher] = await db.select({ id: teachers.id }).from(teachers).where(eq(teachers.id, teacherId));
+    if (!teacher) throw new NotFound("Teacher not found");
+
+    const rawSessions = await db
+        .select({
+            id: sessions.id,
+            name: sessions.name,
+            scheduleType: sessions.scheduleType,
+            sessionDate: sessions.sessionDate,
+            startDate: sessions.startDate,
+            endDate: sessions.endDate,
+            timeFrom: sessions.timeFrom,
+            timeTo: sessions.timeTo,
+            sessionLink: sessions.session_link,
+            materialLink: sessions.material_link,
+            sessionRelationalType: sessions.sessionRelationalType,
+            contentAccessDays: sessions.contentAccessDays,
+            session_pdf: sessions.session_pdf,
+            session_answers_pdf: sessions.session_answers_pdf,
+            teacher_explanation_pdf: sessions.teacher_explanation_pdf,
+            createdAt: sessions.createdAt,
+        })
+        .from(sessions)
+        .where(eq(sessions.teacherId, teacherId))
+        .orderBy(desc(sessions.sessionDate), desc(sessions.timeFrom));
+
+    const sessionIds = rawSessions.map(s => s.id);
+    const [resourcesBySession, ratingsBySession, materialsBySession] = await Promise.all([
+        fetchSessionResources(sessionIds),
+        fetchSessionRatings(sessionIds),
+        resolveSessionMaterials(sessionIds),
+    ]);
+
+    const result = rawSessions.map(s => {
+        const ratings = ratingsBySession.get(s.id) || [];
+        const overallSum = ratings.reduce((sum, r) => sum + (Number(r.overallRating) || 0), 0);
+        const averageRating = ratings.length > 0 ? Number((overallSum / ratings.length).toFixed(2)) : null;
+        const mat = materialsBySession.get(s.id) || emptySessionMaterials();
+
+        return {
+            ...s,
+            session_pdf: mat.session_pdf,
+            session_answers_pdf: mat.session_answers_pdf,
+            materials: mat.materials,
+            lessons: resourcesBySession.get(s.id) || [],
+            averageRating,
+            totalRatedStudents: ratings.length,
+            ratings,
+        };
+    });
+
+    return SuccessResponse(res, {
+        message: "Sessions fetched successfully",
+        count: result.length,
+        sessions: result,
+    }, 200);
+};
+
+export const getUpcomingTeacherSessions = async (req: Request, res: Response) => {
+    const teacherId = getTeacherId(req);
+    const now = new Date();
+    const today = now.toISOString().split("T")[0];
+    const currentTime = now.toISOString().split("T")[1].slice(0, 8);
+
+    const [teacher] = await db.select({ id: teachers.id }).from(teachers).where(eq(teachers.id, teacherId));
+    if (!teacher) throw new NotFound("Teacher not found");
+
+    const rawSessions = await db
+        .select({
+            id: sessions.id,
+            name: sessions.name,
+            scheduleType: sessions.scheduleType,
+            sessionDate: sessions.sessionDate,
+            startDate: sessions.startDate,
+            endDate: sessions.endDate,
+            timeFrom: sessions.timeFrom,
+            timeTo: sessions.timeTo,
+            sessionLink: sessions.session_link,
+            materialLink: sessions.material_link,
+            sessionRelationalType: sessions.sessionRelationalType,
+            contentAccessDays: sessions.contentAccessDays,
+            session_pdf: sessions.session_pdf,
+            session_answers_pdf: sessions.session_answers_pdf,
+            teacher_explanation_pdf: sessions.teacher_explanation_pdf,
+        })
+        .from(sessions)
+        .where(
+            and(
+                eq(sessions.teacherId, teacherId),
+                sql`(
+                    ${sessions.sessionDate} > ${today}
+                    OR (${sessions.sessionDate} = ${today} AND ${sessions.timeTo} >= ${currentTime})
+                )`
+            )
+        )
+        .orderBy(asc(sessions.sessionDate), asc(sessions.timeFrom));
+
+    const sessionIds = rawSessions.map(s => s.id);
+    const [resourcesBySession, ratingsBySession, materialsBySession] = await Promise.all([
+        fetchSessionResources(sessionIds),
+        fetchSessionRatings(sessionIds),
+        resolveSessionMaterials(sessionIds),
+    ]);
+
+    const result = rawSessions.map(s => {
+        const ratings = ratingsBySession.get(s.id) || [];
+        const overallSum = ratings.reduce((sum, r) => sum + (Number(r.overallRating) || 0), 0);
+        const averageRating = ratings.length > 0 ? Number((overallSum / ratings.length).toFixed(2)) : null;
+        const mat = materialsBySession.get(s.id) || emptySessionMaterials();
+
+        return {
+            ...s,
+            session_pdf: mat.session_pdf,
+            session_answers_pdf: mat.session_answers_pdf,
+            materials: mat.materials,
+            lessons: resourcesBySession.get(s.id) || [],
+            averageRating,
+            totalRatedStudents: ratings.length,
+            ratings,
+        };
+    });
+
+    return SuccessResponse(res, {
+        message: "Upcoming sessions fetched successfully",
+        count: result.length,
+        sessions: result,
+    }, 200);
+};
+
+export const getPastTeacherSessions = async (req: Request, res: Response) => {
+    const teacherId = getTeacherId(req);
+    const now = new Date();
+    const today = now.toISOString().split("T")[0];
+    const currentTime = now.toISOString().split("T")[1].slice(0, 8);
+
+    const [teacher] = await db.select({ id: teachers.id }).from(teachers).where(eq(teachers.id, teacherId));
+    if (!teacher) throw new NotFound("Teacher not found");
+
+    const rawSessions = await db
+        .select({
+            id: sessions.id,
+            name: sessions.name,
+            scheduleType: sessions.scheduleType,
+            sessionDate: sessions.sessionDate,
+            startDate: sessions.startDate,
+            endDate: sessions.endDate,
+            timeFrom: sessions.timeFrom,
+            timeTo: sessions.timeTo,
+            sessionLink: sessions.session_link,
+            materialLink: sessions.material_link,
+            sessionRelationalType: sessions.sessionRelationalType,
+            contentAccessDays: sessions.contentAccessDays,
+            session_pdf: sessions.session_pdf,
+            session_answers_pdf: sessions.session_answers_pdf,
+            teacher_explanation_pdf: sessions.teacher_explanation_pdf,
+        })
+        .from(sessions)
+        .where(
+            and(
+                eq(sessions.teacherId, teacherId),
+                sql`(
+                    ${sessions.sessionDate} < ${today}
+                    OR (${sessions.sessionDate} = ${today} AND ${sessions.timeTo} < ${currentTime})
+                )`
+            )
+        )
+        .orderBy(desc(sessions.sessionDate), desc(sessions.timeFrom));
+
+    const sessionIds = rawSessions.map(s => s.id);
+    const [resourcesBySession, ratingsBySession, materialsBySession] = await Promise.all([
+        fetchSessionResources(sessionIds),
+        fetchSessionRatings(sessionIds),
+        resolveSessionMaterials(sessionIds),
+    ]);
+
+    const result = rawSessions.map(s => {
+        const ratings = ratingsBySession.get(s.id) || [];
+        const overallSum = ratings.reduce((sum, r) => sum + (Number(r.overallRating) || 0), 0);
+        const averageRating = ratings.length > 0 ? Number((overallSum / ratings.length).toFixed(2)) : null;
+        const mat = materialsBySession.get(s.id) || emptySessionMaterials();
+
+        return {
+            ...s,
+            session_pdf: mat.session_pdf,
+            session_answers_pdf: mat.session_answers_pdf,
+            materials: mat.materials,
+            lessons: resourcesBySession.get(s.id) || [],
+            averageRating,
+            totalRatedStudents: ratings.length,
+            ratings,
+        };
+    });
+
+    return SuccessResponse(res, {
+        message: "Past sessions fetched successfully",
+        count: result.length,
+        sessions: result,
+    }, 200);
+};
+
+export const getTeacherSessionById = async (req: Request, res: Response) => {
+    const teacherId = getTeacherId(req);
+    const { id } = req.params;
+
+    const [session] = await db
+        .select({
+            id: sessions.id,
+            name: sessions.name,
+            scheduleType: sessions.scheduleType,
+            sessionDate: sessions.sessionDate,
+            startDate: sessions.startDate,
+            endDate: sessions.endDate,
+            timeFrom: sessions.timeFrom,
+            timeTo: sessions.timeTo,
+            sessionLink: sessions.session_link,
+            materialLink: sessions.material_link,
+            teacherMaterialLink: sessions.teacher_material_link,
+            sessionRelationalType: sessions.sessionRelationalType,
+            contentAccessDays: sessions.contentAccessDays,
+            session_pdf: sessions.session_pdf,
+            session_answers_pdf: sessions.session_answers_pdf,
+            teacher_explanation_pdf: sessions.teacher_explanation_pdf,
+            createdAt: sessions.createdAt,
+        })
+        .from(sessions)
+        .where(and(eq(sessions.id, id), eq(sessions.teacherId, teacherId)));
+
+    if (!session) throw new NotFound("Session not found");
+
+    // Lessons + resources
+    const resourcesBySession = await fetchSessionResources([id]);
+    const ratingsBySession = await fetchSessionRatings([id]);
+    const ratings = ratingsBySession.get(id) || [];
+    const overallSum = ratings.reduce((sum, r) => sum + (Number(r.overallRating) || 0), 0);
+    const averageRating = ratings.length > 0 ? Number((overallSum / ratings.length).toFixed(2)) : null;
+
+    // Linked groups
+    const linkedGroups = await db
+        .select({ id: groups.id, name: groups.name })
+        .from(sessionGroups)
+        .innerJoin(groups, eq(sessionGroups.groupId, groups.id))
+        .where(eq(sessionGroups.sessionId, id));
+
+    // Total enrolled student count
+    const directStudents = await db
+        .select({ studentId: sessionUsers.studentId })
+        .from(sessionUsers)
+        .where(eq(sessionUsers.sessionId, id));
+
+    const groupStudentRows = await db
+        .select({ studentId: groupStudents.studentId })
+        .from(sessionGroups)
+        .innerJoin(groupStudents, eq(sessionGroups.groupId, groupStudents.groupId))
+        .where(eq(sessionGroups.sessionId, id));
+
+    const allStudentIds = new Set([
+        ...directStudents.map(s => s.studentId),
+        ...groupStudentRows.map(s => s.studentId),
+    ]);
+
+    // For Mistakes sessions, fetch per-student PDFs
+    let studentPdfs: any[] = [];
+    if (session.sessionRelationalType === "Mistakes") {
+        studentPdfs = await db
+            .select({
+                id: sessionStudentPdfs.id,
+                studentId: sessionStudentPdfs.studentId,
+                studentName: sql<string>`CONCAT(${Student.firstname}, ' ', ${Student.lastname})`.as("studentName"),
+                studentAvatar: Student.avatar,
+                studentEmail: Student.email,
+                session_pdf: sessionStudentPdfs.session_pdf,
+                session_answers_pdf: sessionStudentPdfs.session_answers_pdf,
+                teacher_explanation_pdf: sessionStudentPdfs.teacher_explanation_pdf,
+                createdAt: sessionStudentPdfs.createdAt,
+                updatedAt: sessionStudentPdfs.updatedAt,
+            })
+            .from(sessionStudentPdfs)
+            .innerJoin(Student, eq(sessionStudentPdfs.studentId, Student.id))
+            .where(eq(sessionStudentPdfs.sessionId, id));
+    }
+
+    const materialsMap = await resolveSessionMaterials([id]);
+    const mat = materialsMap.get(id) || emptySessionMaterials();
+
+    return SuccessResponse(res, {
+        message: "Session fetched successfully",
+        session: {
+            ...session,
+            session_pdf: mat.session_pdf,
+            session_answers_pdf: mat.session_answers_pdf,
+            materials: mat.materials,
+            lessons: resourcesBySession.get(id) || [],
+            groups: linkedGroups,
+            studentsCount: allStudentIds.size,
+            averageRating,
+            totalRatedStudents: ratings.length,
+            ratings,
+            studentPdfs: session.sessionRelationalType === "Mistakes" ? studentPdfs : undefined,
+        },
+    }, 200);
+};
+
+export const getSessionStudents = async (req: Request, res: Response) => {
+    const teacherId = getTeacherId(req);
+    const { id: sessionId } = req.params;
+
+    // Verify this session belongs to the teacher
+    const [session] = await db
+        .select({
+            id: sessions.id,
+            session_pdf: sessions.session_pdf,
+            session_answers_pdf: sessions.session_answers_pdf,
+            teacher_explanation_pdf: sessions.teacher_explanation_pdf,
+            sessionRelationalType: sessions.sessionRelationalType,
+        })
+        .from(sessions)
+        .where(and(eq(sessions.id, sessionId), eq(sessions.teacherId, teacherId)));
+
+    if (!session) throw new NotFound("Session not found");
+
+    const materialsMap = await resolveSessionMaterials([sessionId]);
+    const effective = materialsMap.get(sessionId) || emptySessionMaterials();
+
+    // 1. Direct students
+    const directRows = await db
+        .select({
+            studentId: sessionUsers.studentId,
+            enrollmentType: sql<string>`'direct'`,
+        })
+        .from(sessionUsers)
+        .where(eq(sessionUsers.sessionId, sessionId));
+
+    // 2. Group students
+    const groupRows = await db
+        .select({
+            studentId: groupStudents.studentId,
+            enrollmentType: sql<string>`'group'`,
+            groupId: groupStudents.groupId,
+        })
+        .from(sessionGroups)
+        .innerJoin(groupStudents, eq(sessionGroups.groupId, groupStudents.groupId))
+        .where(eq(sessionGroups.sessionId, sessionId));
+
+    // Merge & deduplicate
+    const studentMap = new Map<string, { studentId: string; enrollmentType: string; groupId?: string }>();
+    directRows.forEach(r => studentMap.set(r.studentId, { studentId: r.studentId, enrollmentType: "direct" }));
+    groupRows.forEach(r => {
+        if (!studentMap.has(r.studentId)) {
+            studentMap.set(r.studentId, { studentId: r.studentId, enrollmentType: "group", groupId: r.groupId });
+        }
+    });
+
+    const allStudentIds = Array.from(studentMap.keys());
+
+    if (allStudentIds.length === 0) {
+        return SuccessResponse(res, {
+            message: "No students enrolled in this session",
+            count: 0,
+            session_pdf: effective.session_pdf,
+            session_answers_pdf: effective.session_answers_pdf,
+            teacher_explanation_pdf: session.teacher_explanation_pdf,
+            materials: effective.materials,
+            students: [],
+        }, 200);
+    }
+
+    // 3. Fetch student info
+    const studentRows = await db
+        .select({
+            id: Student.id,
+            firstname: Student.firstname,
+            lastname: Student.lastname,
+            phone: Student.phone,
+            avatar: Student.avatar,
+        })
+        .from(Student)
+        .where(inArray(Student.id, allStudentIds));
+
+    // 4. Fetch attendance
+    const attendanceRows = await db
+        .select({
+            studentId: sessionAttendance.studentId,
+            status: sessionAttendance.status,
+            attendedAt: sessionAttendance.attendedAt,
+        })
+        .from(sessionAttendance)
+        .where(eq(sessionAttendance.sessionId, sessionId));
+
+    const attendanceMap = new Map(attendanceRows.map(a => [a.studentId, a]));
+
+    // 5. Fetch student ratings
+    const ratingRows = await db
+        .select({
+            id: sessionStudentRatings.id,
+            studentId: sessionStudentRatings.studentId,
+            overallRating: sessionStudentRatings.overallRating,
+            generalComment: sessionStudentRatings.generalComment,
+            ratedByTeacherId: sessionStudentRatings.ratedByTeacherId,
+            ratedByAdminId: sessionStudentRatings.ratedByAdminId,
+            createdAt: sessionStudentRatings.createdAt,
+            updatedAt: sessionStudentRatings.updatedAt,
+        })
+        .from(sessionStudentRatings)
+        .where(
+            and(
+                eq(sessionStudentRatings.sessionId, sessionId),
+                inArray(sessionStudentRatings.studentId, allStudentIds)
+            )
+        );
+
+    const ratingIds = ratingRows.map(r => r.id);
+    const questionRatingsMap = new Map<string, any[]>();
+
+    if (ratingIds.length > 0) {
+        const questionRatings = await db
+            .select({
+                id: sessionStudentQuestionRatings.id,
+                sessionStudentRatingId: sessionStudentQuestionRatings.sessionStudentRatingId,
+                questionId: sessionStudentQuestionRatings.questionId,
+                rating: sessionStudentQuestionRatings.rating,
+                comment: sessionStudentQuestionRatings.comment,
+                questionTitle: sessionRatingQuestions.title,
+                questionCategory: sessionRatingQuestions.category,
+                questionWeight: sessionRatingQuestions.weight,
+            })
+            .from(sessionStudentQuestionRatings)
+            .innerJoin(sessionRatingQuestions, eq(sessionStudentQuestionRatings.questionId, sessionRatingQuestions.id))
+            .where(inArray(sessionStudentQuestionRatings.sessionStudentRatingId, ratingIds));
+
+        questionRatings.forEach(qr => {
+            if (!questionRatingsMap.has(qr.sessionStudentRatingId)) {
+                questionRatingsMap.set(qr.sessionStudentRatingId, []);
+            }
+            questionRatingsMap.get(qr.sessionStudentRatingId)!.push({
+                id: qr.id,
+                questionId: qr.questionId,
+                questionTitle: qr.questionTitle,
+                category: qr.questionCategory,
+                weight: qr.questionWeight,
+                rating: qr.rating,
+                comment: qr.comment,
+            });
+        });
+    }
+
+    const ratingMap = new Map(
+        ratingRows.map(r => [
+            r.studentId,
+            {
+                id: r.id,
+                overallRating: Number(r.overallRating),
+                generalComment: r.generalComment,
+                ratedByTeacherId: r.ratedByTeacherId,
+                ratedByAdminId: r.ratedByAdminId,
+                createdAt: r.createdAt,
+                updatedAt: r.updatedAt,
+                questionRatings: questionRatingsMap.get(r.id) || [],
+            }
+        ])
+    );
+
+    // 6. Fetch per-student PDFs
+    const studentPdfRows = await db
+        .select({
+            studentId: sessionStudentPdfs.studentId,
+            session_pdf: sessionStudentPdfs.session_pdf,
+            session_answers_pdf: sessionStudentPdfs.session_answers_pdf,
+            teacher_explanation_pdf: sessionStudentPdfs.teacher_explanation_pdf,
+        })
+        .from(sessionStudentPdfs)
+        .where(eq(sessionStudentPdfs.sessionId, sessionId));
+
+    const studentPdfMap = new Map(studentPdfRows.map(p => [p.studentId, p]));
+
+    const formattedStudents = studentRows.map(student => {
+        const attendance = attendanceMap.get(student.id);
+        const enrollment = studentMap.get(student.id);
+        const rating = ratingMap.get(student.id) || null;
+        const studentPdf = studentPdfMap.get(student.id);
+
+        return {
+            id: student.id,
+            name: `${student.firstname} ${student.lastname}`,
+            phone: student.phone,
+            avatar: student.avatar,
+            enrollmentType: enrollment?.enrollmentType ?? "direct",
+            groupId: enrollment?.groupId ?? null,
+            attendance: attendance
+                ? {
+                    status: attendance.status,
+                    attendedAt: attendance.attendedAt,
+                }
+                : { status: "not_marked", attendedAt: null },
+            rating,
+            pdfs: {
+                session_pdf: studentPdf?.session_pdf ?? effective.session_pdf ?? null,
+                session_answers_pdf: studentPdf?.session_answers_pdf ?? effective.session_answers_pdf ?? null,
+                teacher_explanation_pdf: studentPdf?.teacher_explanation_pdf ?? session.teacher_explanation_pdf ?? null,
+            },
+        };
+    });
+
+    return SuccessResponse(res, {
+        message: "Session students fetched successfully",
+        count: formattedStudents.length,
+        session_pdf: effective.session_pdf,
+        session_answers_pdf: effective.session_answers_pdf,
+        teacher_explanation_pdf: session.teacher_explanation_pdf,
+        materials: effective.materials,
+        students: formattedStudents,
+    }, 200);
+};
+
+export const uploadTeacherExplanationPdf = async (req: Request, res: Response) => {
+    const teacherId = getTeacherId(req);
+    const { id: sessionId } = req.params;
+    const { teacher_explanation_pdf, session_link, studentId } = req.body;
+
+    if (!teacher_explanation_pdf && !session_link) {
+        throw new BadRequest("Either teacher_explanation_pdf or session_link is required");
+    }
+
+    const [session] = await db
+        .select()
+        .from(sessions)
+        .where(and(eq(sessions.id, sessionId), eq(sessions.teacherId, teacherId)));
+
+    if (!session) throw new NotFound("Session not found or not assigned to you");
+
+    // Handle teacher explanation PDF upload
+    let savedPdfUrl: string | null = null;
+    if (teacher_explanation_pdf) {
+        if (teacher_explanation_pdf.startsWith("http")) {
+            savedPdfUrl = teacher_explanation_pdf;
+        } else {
+            savedPdfUrl = await validateAndSavePdf(req, teacher_explanation_pdf, "session-pdfs");
+        }
+    }
+
+    // Handle session link: teacher's link replaces admin-added link
+    let savedLinkUrl: string | null = null;
+    if (session_link) {
+        savedLinkUrl = session_link;
+    }
+
+    if (studentId) {
+        // Targeted student explanation PDF (especially for Mistakes sessions)
+        // Verify student is enrolled in this session
+        const [isDirect] = await db
+            .select({ id: sessionUsers.id })
+            .from(sessionUsers)
+            .where(and(eq(sessionUsers.sessionId, sessionId), eq(sessionUsers.studentId, studentId)));
+
+        let isEnrolled = !!isDirect;
+        if (!isEnrolled) {
+            const [isGroup] = await db
+                .select({ id: sessionGroups.id })
+                .from(sessionGroups)
+                .innerJoin(groupStudents, eq(sessionGroups.groupId, groupStudents.groupId))
+                .where(and(eq(sessionGroups.sessionId, sessionId), eq(groupStudents.studentId, studentId)));
+            isEnrolled = !!isGroup;
+        }
+
+        if (!isEnrolled) {
+            throw new BadRequest("Student is not enrolled in this session");
+        }
+
+        const [existing] = await db
+            .select()
+            .from(sessionStudentPdfs)
+            .where(and(
+                eq(sessionStudentPdfs.sessionId, sessionId),
+                eq(sessionStudentPdfs.studentId, studentId)
+            ));
+
+        if (existing) {
+            if (existing.teacher_explanation_pdf && !existing.teacher_explanation_pdf.startsWith("http")) {
+                await deleteImage(existing.teacher_explanation_pdf);
+            }
+            await db
+                .update(sessionStudentPdfs)
+                .set({ teacher_explanation_pdf: savedPdfUrl })
+                .where(eq(sessionStudentPdfs.id, existing.id));
+        } else {
+            await db.insert(sessionStudentPdfs).values({
+                id: randomUUID(),
+                sessionId,
+                studentId,
+                session_pdf: null,
+                session_answers_pdf: null,
+                teacher_explanation_pdf: savedPdfUrl,
+            });
+        }
+
+        return SuccessResponse(res, {
+            message: "Explanation PDF uploaded successfully for student",
+            teacher_explanation_pdf: savedPdfUrl,
+            session_link: savedLinkUrl,
+            studentId,
+        }, 200);
+    } else {
+        // Session-wide teacher explanation PDF and session link
+        if (savedPdfUrl) {
+            if (session.teacher_explanation_pdf && !session.teacher_explanation_pdf.startsWith("http")) {
+                await deleteImage(session.teacher_explanation_pdf);
+            }
+
+            await db
+                .update(sessions)
+                .set({ teacher_explanation_pdf: savedPdfUrl })
+                .where(eq(sessions.id, sessionId));
+        }
+
+        // Teacher's session link replaces any admin-added link
+        if (savedLinkUrl) {
+            await db
+                .update(sessions)
+                .set({ session_link: savedLinkUrl })
+                .where(eq(sessions.id, sessionId));
+        }
+
+        return SuccessResponse(res, {
+            message: "Teacher explanation PDF and session link uploaded successfully for session",
+            teacher_explanation_pdf: savedPdfUrl,
+            session_link: savedLinkUrl,
+        }, 200);
+    }
+};
+
+export const deleteTeacherExplanationPdf = async (req: Request, res: Response) => {
+    const teacherId = getTeacherId(req);
+    const { id: sessionId } = req.params;
+    const studentId = (req.body?.studentId || req.query?.studentId) as string | undefined;
+
+    const [session] = await db
+        .select()
+        .from(sessions)
+        .where(and(eq(sessions.id, sessionId), eq(sessions.teacherId, teacherId)));
+
+    if (!session) throw new NotFound("Session not found or not assigned to you");
+
+    if (studentId) {
+        const [existing] = await db
+            .select()
+            .from(sessionStudentPdfs)
+            .where(and(
+                eq(sessionStudentPdfs.sessionId, sessionId),
+                eq(sessionStudentPdfs.studentId, studentId)
+            ));
+
+        if (existing && existing.teacher_explanation_pdf) {
+            if (!existing.teacher_explanation_pdf.startsWith("http")) {
+                await deleteImage(existing.teacher_explanation_pdf);
+            }
+            await db
+                .update(sessionStudentPdfs)
+                .set({ teacher_explanation_pdf: null })
+                .where(eq(sessionStudentPdfs.id, existing.id));
+        }
+    } else {
+        if (session.teacher_explanation_pdf && !session.teacher_explanation_pdf.startsWith("http")) {
+            await deleteImage(session.teacher_explanation_pdf);
+        }
+        await db
+            .update(sessions)
+            .set({ teacher_explanation_pdf: null })
+            .where(eq(sessions.id, sessionId));
+    }
+
+    return SuccessResponse(res, { message: "Teacher explanation PDF deleted successfully" }, 200);
+};
+

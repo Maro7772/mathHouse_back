@@ -1,0 +1,392 @@
+import { Request, Response } from "express";
+import { db } from "../../models/connection";
+import { chapters, courses, category, teachers, lessons, lessonIdeas, semesters, prices } from "../../models/schema";
+import { eq, max, asc, and, gt, sql, inArray } from "drizzle-orm";
+import { SuccessResponse } from "../../utils/response";
+import { BadRequest } from "../../Errors/BadRequest";
+import { handleImageUpdate, validateAndSaveLogo, deleteImage } from "../../utils/handleImages";
+import { randomUUID } from "crypto";
+
+// Shared detailed select with joins for chapters
+const chapterDetailedQuery = () =>
+    db.select({
+        chapter: {
+            id: chapters.id,
+            name: chapters.name,
+            description: chapters.description,
+            image: chapters.image,
+            preRequisition: chapters.preRequisition,
+            whatYouGain: chapters.whatYouGain,
+            order: chapters.order,
+            createdAt: chapters.createdAt,
+            updatedAt: chapters.updatedAt,
+        },
+        course: {
+            id: courses.id,
+            name: courses.name,
+            description: courses.description,
+            image: courses.image,
+        },
+        category: {
+            id: category.id,
+            name: category.name,
+            description: category.description,
+            image: category.image,
+        },
+        teacher: {
+            id: teachers.id,
+            name: teachers.name,
+            email: teachers.email,
+            avatar: teachers.avatar,
+        },
+        semester: {
+            id: semesters.id,
+            name: semesters.name,
+        }
+    })
+        .from(chapters)
+        .leftJoin(courses, eq(chapters.courseId, courses.id))
+        .leftJoin(category, eq(chapters.categoryId, category.id))
+        .leftJoin(teachers, eq(chapters.teacherId, teachers.id))
+        .leftJoin(semesters, eq(chapters.semesterId, semesters.id));
+
+export const createChapter = async (req: Request, res: Response) => {
+    const { name, courseId, semesterId, description, image, teacherId, preRequisition, whatYouGain, pricePlans } = req.body;
+    if (!name || !courseId || !teacherId) {
+        throw new BadRequest("Name, Course ID, Teacher ID are required");
+    }
+    // validation of price plans
+    if (!pricePlans || pricePlans.length === 0) {
+        throw new BadRequest("Price Plans are required");
+    }
+    for (const plan of pricePlans) {
+        if (plan.hasDiscount) {
+            if (Number(plan.discountEgp) > Number(plan.priceEgp)) {
+                throw new BadRequest(`EGP Discount cannot be greater than price in plan: ${plan.label}`);
+            }
+            if (Number(plan.discountUsd) > Number(plan.priceUsd)) {
+                throw new BadRequest(`USD Discount cannot be greater than price in plan: ${plan.label}`);
+            }
+        }
+    }
+    const existingChapter = await db.select().from(chapters).where(eq(chapters.name, name));
+    if (existingChapter.length > 0) {
+        throw new BadRequest("Chapter already exists");
+    }
+    const existingCourse = await db.select().from(courses).where(eq(courses.id, courseId));
+    if (existingCourse.length === 0) {
+        throw new BadRequest("Course not found");
+    }
+
+    // Derive categoryId from the course
+    const categoryId = existingCourse[0].categoryId;
+
+    const existingTeacher = await db.select().from(teachers).where(eq(teachers.id, teacherId));
+    if (existingTeacher.length === 0) {
+        throw new BadRequest("Teacher not found");
+    }
+
+    if (semesterId) {
+        const existingSemester = await db.select().from(semesters).where(eq(semesters.id, semesterId));
+        if (existingSemester.length === 0) {
+            throw new BadRequest("Semester not found");
+        }
+        if (existingSemester[0].courseId !== courseId) {
+            throw new BadRequest("The selected semester does not belong to the selected course");
+        }
+    }
+
+    // Auto-compute order: MAX(order) + 1 for this course
+    const [maxOrderResult] = await db.select({ maxOrder: max(chapters.order) }).from(chapters).where(eq(chapters.courseId, courseId));
+    const nextOrder = (maxOrderResult?.maxOrder ?? 0) + 1;
+
+    let imageURL = null;
+    if (image) {
+        imageURL = await validateAndSaveLogo(req, image, "chapters");
+    }
+    const chapterId = randomUUID();
+
+    await db.transaction(async (tx) => {
+        await tx.insert(chapters).values({
+            id: chapterId,
+            name,
+            courseId,
+            semesterId,
+            categoryId,
+            teacherId,
+            preRequisition,
+            whatYouGain,
+            description,
+            image: imageURL,
+            order: nextOrder,
+        });
+
+        const priceValues = pricePlans.map((plan: any, index: number) => ({
+            id: randomUUID(),
+            targetId: chapterId,
+            targetType: "chapter" as const,
+            durationLabel: plan.label,
+            durationDays: plan.days,
+            priceEgp: plan.priceEgp,
+            priceUsd: plan.priceUsd,
+            discountEgp: plan.discountEgp || "0.00",
+            discountUsd: plan.discountUsd || "0.00",
+            hasDiscount: plan.hasDiscount || false,
+            isDefault: index === 0,
+        }));
+        await tx.insert(prices).values(priceValues);
+    });
+
+    return SuccessResponse(res, { message: "Chapter created successfully", order: nextOrder }, 200);
+}
+
+export const getChapterById = async (req: Request, res: Response) => {
+    const { id } = req.params;
+    const result = await chapterDetailedQuery().where(eq(chapters.id, id));
+    if (result.length === 0) {
+        throw new BadRequest("Chapter not found");
+    }
+
+    const chapterPrices = await db.select()
+        .from(prices)
+        .where(and(eq(prices.targetId, id), eq(prices.targetType, "chapter")));
+
+    return SuccessResponse(res, { message: "Chapter fetched successfully", ...result[0], prices: chapterPrices }, 200);
+}
+
+export const getAllChapters = async (req: Request, res: Response) => {
+    const allChapters = await chapterDetailedQuery().orderBy(asc(chapters.order));
+
+    const chapterIds = allChapters.map(c => c.chapter.id);
+    let allPrices: any[] = [];
+    if (chapterIds.length > 0) {
+        allPrices = await db.select().from(prices).where(and(inArray(prices.targetId, chapterIds), eq(prices.targetType, "chapter")));
+    }
+
+    const result = allChapters.map(c => ({
+        ...c,
+        prices: allPrices.filter(p => p.targetId === c.chapter.id)
+    }));
+
+    return SuccessResponse(res, { message: "Chapters fetched successfully", chapters: result }, 200);
+}
+
+export const getAllChaptersByCourseId = async (req: Request, res: Response) => {
+    const { courseId } = req.params;
+    const allChapters = await chapterDetailedQuery()
+        .where(eq(chapters.courseId, courseId))
+        .orderBy(asc(chapters.order));
+
+    const chapterIds = allChapters.map(c => c.chapter.id);
+    let allPrices: any[] = [];
+    if (chapterIds.length > 0) {
+        allPrices = await db.select().from(prices).where(and(inArray(prices.targetId, chapterIds), eq(prices.targetType, "chapter")));
+    }
+
+    const result = allChapters.map(c => ({
+        ...c,
+        prices: allPrices.filter(p => p.targetId === c.chapter.id)
+    }));
+
+    return SuccessResponse(res, { message: "Chapters fetched successfully", chapters: result }, 200);
+}
+
+export const getAllChaptersBySemesterId = async (req: Request, res: Response) => {
+    const { semesterId } = req.params;
+
+    const existingSemester = await db.select().from(semesters).where(eq(semesters.id, semesterId));
+    if (existingSemester.length === 0) {
+        throw new BadRequest("Semester not found");
+    }
+
+    const allChapters = await chapterDetailedQuery()
+        .where(eq(chapters.semesterId, semesterId))
+        .orderBy(asc(chapters.order));
+
+    const chapterIds = allChapters.map(c => c.chapter.id);
+    let allPrices: any[] = [];
+    if (chapterIds.length > 0) {
+        allPrices = await db.select().from(prices).where(and(inArray(prices.targetId, chapterIds), eq(prices.targetType, "chapter")));
+    }
+
+    const result = allChapters.map(c => ({
+        ...c,
+        prices: allPrices.filter(p => p.targetId === c.chapter.id)
+    }));
+
+    return SuccessResponse(res, { message: "Chapters fetched successfully", chapters: result }, 200);
+};
+
+export const getChaptersBySemesterId = getAllChaptersBySemesterId;
+
+export const swapChapterOrder = async (req: Request, res: Response) => {
+    const { chapterIdA, chapterIdB } = req.body;
+    if (!chapterIdA || !chapterIdB) {
+        throw new BadRequest("chapterIdA and chapterIdB are required");
+    }
+
+    const [chapterA] = await db.select().from(chapters).where(eq(chapters.id, chapterIdA));
+    const [chapterB] = await db.select().from(chapters).where(eq(chapters.id, chapterIdB));
+
+    if (!chapterA || !chapterB) {
+        throw new BadRequest("One or both chapters not found");
+    }
+
+    if (chapterA.courseId !== chapterB.courseId) {
+        throw new BadRequest("Both chapters must belong to the same course");
+    }
+
+    // Swap orders
+    await db.update(chapters).set({ order: chapterB.order }).where(eq(chapters.id, chapterIdA));
+    await db.update(chapters).set({ order: chapterA.order }).where(eq(chapters.id, chapterIdB));
+
+    return SuccessResponse(res, { message: "Chapter order swapped successfully" }, 200);
+}
+
+export const updateChapter = async (req: Request, res: Response) => {
+    const { id } = req.params;
+    const { name, courseId, semesterId, description, image, teacherId, preRequisition, whatYouGain, pricePlans } = req.body;
+
+    const [existingChapter] = await db.select().from(chapters).where(eq(chapters.id, id));
+    if (!existingChapter) {
+        throw new BadRequest("Chapter not found");
+    }
+
+    // validation of price plans
+    if (pricePlans && pricePlans.length > 0) {
+        for (const plan of pricePlans) {
+            if (plan.hasDiscount) {
+                if (Number(plan.discountEgp) > Number(plan.priceEgp)) {
+                    throw new BadRequest(`EGP Discount cannot be greater than price in plan: ${plan.label}`);
+                }
+                if (Number(plan.discountUsd) > Number(plan.priceUsd)) {
+                    throw new BadRequest(`USD Discount cannot be greater than price in plan: ${plan.label}`);
+                }
+            }
+        }
+    }
+
+    // If name is being changed, check for duplicates
+    if (name && name !== existingChapter.name) {
+        const duplicate = await db.select().from(chapters).where(eq(chapters.name, name));
+        if (duplicate.length > 0) {
+            throw new BadRequest("A chapter with this name already exists");
+        }
+    }
+
+    // If courseId is changing, validate and derive new categoryId
+    let categoryId = existingChapter.categoryId;
+    if (courseId && courseId !== existingChapter.courseId) {
+        const [course] = await db.select().from(courses).where(eq(courses.id, courseId));
+        if (!course) {
+            throw new BadRequest("Course not found");
+        }
+        categoryId = course.categoryId;
+    }
+
+    // If teacherId is changing, validate
+    if (teacherId && teacherId !== existingChapter.teacherId) {
+        const [teacher] = await db.select().from(teachers).where(eq(teachers.id, teacherId));
+        if (!teacher) {
+            throw new BadRequest("Teacher not found");
+        }
+    }
+
+    let updatedSemesterId = existingChapter.semesterId;
+    // If semesterId is explicitly changing
+    if (semesterId !== undefined && semesterId !== existingChapter.semesterId) {
+        if (semesterId) {
+            const [semester] = await db.select().from(semesters).where(eq(semesters.id, semesterId));
+            if (!semester) {
+                throw new BadRequest("Semester not found");
+            }
+            // Use new courseId if provided, else existing
+            const targetCourseId = courseId ?? existingChapter.courseId;
+            if (semester.courseId !== targetCourseId) {
+                throw new BadRequest("The selected semester does not belong to the selected course");
+            }
+        }
+        updatedSemesterId = semesterId; // allows setting it to null
+    } else if (courseId && courseId !== existingChapter.courseId) {
+        // If course changed but semesterId wasn't explicitly passed, clear the old semesterId
+        // because the old semester won't belong to the new course
+        updatedSemesterId = null;
+    }
+
+    // Handle image update
+    const updatedImage = await handleImageUpdate(req, existingChapter.image, image, "chapters");
+
+    await db.transaction(async (tx) => {
+        await tx.update(chapters).set({
+            name: name ?? existingChapter.name,
+            courseId: courseId ?? existingChapter.courseId,
+            semesterId: updatedSemesterId,
+            categoryId,
+            teacherId: teacherId ?? existingChapter.teacherId,
+            description: description !== undefined ? description : existingChapter.description,
+            image: updatedImage ?? existingChapter.image,
+            preRequisition: preRequisition !== undefined ? preRequisition : existingChapter.preRequisition,
+            whatYouGain: whatYouGain !== undefined ? whatYouGain : existingChapter.whatYouGain,
+        }).where(eq(chapters.id, id));
+
+        // Update Price Plans
+        if (pricePlans && pricePlans.length > 0) {
+            await tx.delete(prices).where(and(eq(prices.targetId, id), eq(prices.targetType, "chapter")));
+            const priceValues = pricePlans.map((plan: any, index: number) => ({
+                id: randomUUID(),
+                targetId: id,
+                targetType: "chapter" as const,
+                durationLabel: plan.label,
+                durationDays: plan.days,
+                priceEgp: plan.priceEgp,
+                priceUsd: plan.priceUsd,
+                discountEgp: plan.discountEgp || "0.00",
+                discountUsd: plan.discountUsd || "0.00",
+                hasDiscount: plan.hasDiscount || false,
+                isDefault: index === 0,
+            }));
+            await tx.insert(prices).values(priceValues);
+        }
+    });
+
+    return SuccessResponse(res, { message: "Chapter updated successfully" }, 200);
+}
+export const deleteChapter = async (req: Request, res: Response) => {
+    const { id } = req.params;
+    const [existingChapter] = await db.select().from(chapters).where(eq(chapters.id, id));
+    if (!existingChapter) {
+        throw new BadRequest("Chapter not found");
+    }
+
+    const deletedOrder = existingChapter.order;
+    const parentCourseId = existingChapter.courseId;
+
+    // Cascade: delete all lessons and their ideas under this chapter
+    const chapterLessons = await db.select().from(lessons).where(eq(lessons.chapterId, id));
+
+    for (const lesson of chapterLessons) {
+        // Delete all ideas under this lesson
+        await db.delete(lessonIdeas).where(eq(lessonIdeas.lessonId, lesson.id));
+
+        // Delete lesson image if exists
+        if (lesson.image) {
+            await deleteImage(lesson.image);
+        }
+    }
+
+    // Delete all lessons under this chapter
+    await db.delete(lessons).where(eq(lessons.chapterId, id));
+
+    // Delete chapter pricing
+    await db.delete(prices).where(and(eq(prices.targetId, id), eq(prices.targetType, "chapter")));
+
+    // Delete the chapter
+    await db.delete(chapters).where(eq(chapters.id, id));
+
+    // Re-sequence: decrement order for all chapters after the deleted one in the same course
+    await db.update(chapters)
+        .set({ order: sql`${chapters.order} - 1` })
+        .where(and(eq(chapters.courseId, parentCourseId), gt(chapters.order, deletedOrder)));
+
+    return SuccessResponse(res, { message: "Chapter deleted successfully" }, 200);
+}

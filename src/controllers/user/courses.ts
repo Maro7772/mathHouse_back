@@ -1,0 +1,191 @@
+import { Request, Response } from "express";
+import { courses } from "../../models/schema/admin/courses";
+import { db } from "../../models/connection";
+import { category, teachers, chapters, courseTeachers, semesters, Student, grade, enrolledItems } from "../../models/schema";
+import { prices } from "../../models/schema/admin/prices";
+import { eq, count, inArray, and, or, desc, isNull } from "drizzle-orm";
+import { SuccessResponse } from "../../utils/response";
+import { BadRequest } from "../../Errors/BadRequest";
+import { checkAccess } from "../../utils/accessControl";
+
+// 1. Get all courses 
+export const getAllCourses = async (req: Request, res: Response) => {
+    const studentId = req.user.id;
+
+    // 1. Get student's category (parent category) and grade
+    const [student] = await db
+        .select({ category: Student.category, grade: Student.grade })
+        .from(Student)
+        .where(eq(Student.id, studentId));
+
+    if (!student) throw new BadRequest("Student not found");
+
+    const studentParentCategory = student.category;
+    const studentGrade = student.grade;
+
+    // 2. Find all child categories whose parentCategoryId = student's category
+    const childCategories = await db
+        .select({ id: category.id })
+        .from(category)
+        .where(
+            or(
+                eq(category.id, studentParentCategory),
+                eq(category.parentCategoryId, studentParentCategory)
+            )
+        );
+
+    if (childCategories.length === 0) {
+        return SuccessResponse(res, { message: "All Courses Retrieved Successfully", courses: [] }, 200);
+    }
+
+    const childCategoryIds = childCategories.map((c) => c.id);
+
+    // 3. Return courses in those child categories where the grade matches the student's grade
+    const allCourses = await db
+        .select({
+            id: courses.id,
+            name: courses.name,
+            category: category.name,
+            numberOfChapters: count(chapters.id),
+        })
+        .from(courses)
+        .leftJoin(category, eq(courses.categoryId, category.id))
+        .leftJoin(grade, eq(grade.categoryId, category.id))
+        .leftJoin(chapters, eq(courses.id, chapters.courseId))
+        .where(
+            and(
+                inArray(courses.categoryId, childCategoryIds),
+                eq(grade.id, studentGrade)
+            )
+        )
+        .groupBy(courses.id, courses.name, category.name);
+
+    if (allCourses.length === 0) {
+        return SuccessResponse(res, { message: "All Courses Retrieved Successfully", courses: [] }, 200);
+    }
+
+    const courseIds = allCourses.map(c => c.id);
+
+    // Fetch prices for the courses
+    const coursePrices = await db
+        .select()
+        .from(prices)
+        .where(
+            and(
+                eq(prices.targetType, "course"),
+                inArray(prices.targetId, courseIds)
+            )
+        );
+
+    const studentEnrollments = await db
+        .select({ courseId: enrolledItems.courseId })
+        .from(enrolledItems)
+        .where(and(eq(enrolledItems.studentId, studentId), eq(enrolledItems.status, "active")));
+
+    const enrolledCourseIds = new Set(studentEnrollments.map(e => e.courseId));
+
+    const coursesWithPrices = allCourses.map(course => {
+        return {
+            ...course,
+            pricePlans: coursePrices.filter(p => p.targetId === course.id),
+            isPurchased: enrolledCourseIds.has(course.id)
+        };
+    });
+
+    return SuccessResponse(res, { message: "All Courses Retrieved Successfully", courses: coursesWithPrices }, 200);
+}
+
+// 2. Get course by id 
+export const getCourseById = async (req: Request, res: Response) => {
+    const { id } = req.params;
+    const [course] = await db.select().from(courses).where(eq(courses.id, id));
+    if (!course) throw new BadRequest("Course not found");
+
+    const teachersList = await db.select({
+        name: teachers.name,
+        role: courseTeachers.role,
+    })
+        .from(courseTeachers)
+        .leftJoin(teachers, eq(courseTeachers.teacherId, teachers.id))
+        .where(eq(courseTeachers.courseId, id));
+
+    const courseSemestersList = await db.select({
+        id: semesters.id,
+        name: semesters.name,
+    })
+        .from(semesters)
+        .where(eq(semesters.courseId, id));
+
+    const hasAccess = await checkAccess(req.user.id, {
+        courseId: id
+    });
+
+    const coursePricePlans = await db
+        .select()
+        .from(prices)
+        .where(
+            and(
+                eq(prices.targetType, "course"),
+                eq(prices.targetId, id)
+            )
+        );
+
+    return SuccessResponse(res, { 
+        ...course, 
+        teachers: teachersList, 
+        semesters: courseSemestersList,
+        pricePlans: coursePricePlans,
+        isLocked: !hasAccess
+    }, 200);
+}
+
+// 3. Get purchased courses
+export const getPurchasedCourses = async (req: Request, res: Response) => {
+    const studentId = req.user.id;
+
+    const purchasedCourses = await db
+        .select({
+            course: courses,
+            enrollmentId: enrolledItems.id,
+            expiresAt: enrolledItems.expiresAt,
+            status: enrolledItems.status,
+            createdAt: enrolledItems.createdAt,
+        })
+        .from(enrolledItems)
+        .innerJoin(courses, eq(enrolledItems.courseId, courses.id))
+        .where(
+            and(
+                eq(enrolledItems.studentId, studentId),
+                inArray(enrolledItems.status, ["active", "expired"]),
+                // 🚀 صمام الأمان: نضمن أن السجل للكورس الكامل وليس لشراء شابتر أو درس فرعي
+                isNull(enrolledItems.chapterId),
+                isNull(enrolledItems.lessonId)
+            )
+        )
+        .orderBy(desc(enrolledItems.createdAt));
+
+    // حماية إضافية لمنع تكرار الكورس في الـ Response لو تم تفعيل اشتراكه مرتين بالخطأ
+    const seenCourseIds = new Set<string>();
+    const formattedCourses: any[] = [];
+
+    for (const p of purchasedCourses) {
+        if (!p.course || seenCourseIds.has(p.course.id)) continue;
+        seenCourseIds.add(p.course.id);
+
+        const isExpired = p.expiresAt && p.expiresAt < new Date();
+        
+        formattedCourses.push({
+            ...p.course,
+            enrollmentId: p.enrollmentId,
+            expiresAt: p.expiresAt,
+            status: isExpired ? "this is expired" : p.status,
+            purchasedAt: p.createdAt
+        });
+    }
+
+    return SuccessResponse(res, { 
+        message: "Purchased courses retrieved successfully", 
+        count: formattedCourses.length,
+        courses: formattedCourses
+    }, 200);
+};
