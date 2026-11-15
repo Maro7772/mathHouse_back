@@ -35,6 +35,11 @@ export const errorHandler: ErrorRequestHandler = (
     statusCode = 413;
     message = "The uploaded image is too large. Please upload a smaller image.";
     details = "Max request size exceeded. Limit is 10MB.";
+  } else if (err.cause && (err.cause.sqlMessage || err.cause.code)) {
+    // Drizzle wraps database errors as "Failed query: …" — the real reason is in err.cause.
+    const c = err.cause;
+    message = `Database error: ${c.sqlMessage || c.message || c.code}`;
+    details = { reason: c.sqlMessage || c.message, code: c.code, query: err.query };
   }
 
   const response: IErrorResponse = {
