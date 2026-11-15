@@ -219,19 +219,32 @@ export const getSessionRatingsOverview = async (_req: Request, res: Response) =>
                s.session_relational_type AS type, t.id AS teacherId, t.name AS teacherName,
           (SELECT AVG(r.overall_rating) FROM session_student_ratings r WHERE r.session_id = s.id) AS avgRating,
           (SELECT COUNT(*) FROM session_student_ratings r WHERE r.session_id = s.id) AS rated,
-          (SELECT COUNT(*) FROM session_student_ratings r WHERE r.session_id = s.id AND r.general_comment IS NOT NULL AND TRIM(r.general_comment) <> '') AS comments,
-          (SELECT COUNT(*) FROM (SELECT su.student_id FROM session_users su WHERE su.session_id = s.id
-              UNION SELECT gs.student_id FROM session_groups sg JOIN group_students gs ON gs.group_id = sg.group_id WHERE sg.session_id = s.id) x) AS students
+          (SELECT COUNT(*) FROM session_student_ratings r WHERE r.session_id = s.id AND r.general_comment IS NOT NULL AND TRIM(r.general_comment) <> '') AS comments
         FROM sessions s LEFT JOIN teachers t ON t.id = s.teacher_id
         WHERE s.status = 'scheduled' AND s.session_date <= CURDATE()
         ORDER BY s.session_date DESC, s.time_from DESC
         LIMIT 1000`);
+    // Students per session = direct students + group members, counted once. Done here instead of a
+    // derived table in the SELECT: MariaDB 10.3 (live) can't use the outer s.id inside FROM (SELECT …).
+    const studentsOf = new Map<string, Set<string>>();
+    if (list.length) {
+        const ids = sql.join(list.map((s) => sql`${s.id}`), sql`, `);
+        const links = await rows(sql`
+            SELECT su.session_id AS sid, su.student_id AS stid FROM session_users su WHERE su.session_id IN (${ids})
+            UNION
+            SELECT sg.session_id, gs.student_id FROM session_groups sg JOIN group_students gs ON gs.group_id = sg.group_id
+            WHERE sg.session_id IN (${ids})`);
+        links.forEach((l) => {
+            if (!studentsOf.has(l.sid)) studentsOf.set(l.sid, new Set());
+            studentsOf.get(l.sid)!.add(l.stid);
+        });
+    }
     const ymd = (d: unknown) => (d instanceof Date ? `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}` : String(d).slice(0, 10));
     const out = list.map((s) => ({
         id: s.id, name: s.name, day: ymd(s.day), timeFrom: String(s.timeFrom).slice(0, 5), timeTo: String(s.timeTo).slice(0, 5),
         type: s.type, teacherId: s.teacherId, teacherName: s.teacherName,
         avgRating: s.avgRating == null ? null : Math.round(Number(s.avgRating) * 10) / 10,
-        rated: Number(s.rated), comments: Number(s.comments), students: Number(s.students),
+        rated: Number(s.rated), comments: Number(s.comments), students: studentsOf.get(s.id)?.size || 0,
     }));
     const rated = out.filter((s) => s.rated > 0);
     const totalRated = rated.reduce((a, s) => a + s.rated, 0);

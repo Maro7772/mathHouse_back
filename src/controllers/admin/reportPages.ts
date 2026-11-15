@@ -443,7 +443,7 @@ export const getHomeworkReport = async (_req: Request, res: Response) => {
         JOIN extra_homework h ON h.id = hs.homework_id
         JOIN student st ON st.id = hs.student_id
         GROUP BY st.id, st.first_name, st.last_name, st.nickname
-        ORDER BY avgScore IS NULL, avgScore DESC, name`);
+        ORDER BY AVG(hs.score) IS NULL, AVG(hs.score) DESC, name`); // MariaDB: an aggregate's alias can't be used inside an ORDER BY expression
 
     const n = (r: Row) => ({
         assigned: num(r.assigned), submitted: num(r.submitted), late: num(r.late),
