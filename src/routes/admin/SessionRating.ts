@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { getSessionRatingsOverview } from "../../controllers/admin/store";
 import {
     rateSessionStudents,
     getSessionRatings,
@@ -14,6 +15,7 @@ import { requirePermission } from "../../middlewares/requirePermission";
 const router = Router();
 
 // Rate students for a specific session
+router.get("/overview", requirePermission("session_ratings", "View"), catchAsync(getSessionRatingsOverview));
 router.post("/session/:sessionId", requirePermission("session_ratings", "Add"), catchAsync(rateSessionStudents));
 
 // Get all ratings for a session

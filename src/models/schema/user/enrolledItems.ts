@@ -16,7 +16,7 @@ export const enrolledItems = mysqlTable("enrolledItems", {
     chapterId: char("chapterId", { length: 255 }).references(() => chapters.id, { onDelete: "cascade" }),
     lessonId: char("lessonId", { length: 255 }).references(() => lessons.id, { onDelete: "cascade" }),
     paymentId: char("paymentId", { length: 255 }).references(() => payment.id, { onDelete: "cascade" }),
-    priceId: char("priceId", { length: 36 }).references(() => prices.id, { onDelete: "cascade" }),
+    priceId: char("priceId", { length: 36 }).references(() => prices.id, { onDelete: "set null" }), // deleting a plan must never delete an enrolment
     expiresAt: timestamp("expiresAt"),
     status: mysqlEnum("status", ["active", "pending", "expired"]).default("active"),
     createdAt: timestamp("createdAt").defaultNow(),

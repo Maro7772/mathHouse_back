@@ -10,11 +10,14 @@ import { validate } from "../../middlewares/validation";
 import { studentSchema, updateStudentSchema, idParamsSchema, increaseLessonsDurationSchema } from "../../validation/admin/student";
 import { requirePermission } from "../../middlewares/requirePermission";
 import { getStudentNotes } from "../../controllers/admin/notes";
+import { getStudentsReport } from "../../controllers/admin/reportPages";
 
 const router = Router();
 
 // ── Selection helpers ──────────────────
 router.get("/select", requirePermission("students", "View"), catchAsync(selection));
+// Students list with courses, groups, free days, live sessions left and wallet (same data as Reports → Students)
+router.get("/overview", requirePermission("students", "View"), catchAsync(getStudentsReport));
 
 // ── List & detail ─────────────────────────────────────────────────────────
 router.get("/",    requirePermission("students", "View"), catchAsync(getAllStudents));

@@ -3,6 +3,7 @@ import { authenticated } from "../../middlewares/authenticated";
 import { authorizeRoles } from "../../middlewares/authorized";
 import authRouter from "./auth";
 import sessionsRouter from "./sessions";
+import portalRouter from "./portal";
 
 const router = Router();
 
@@ -13,5 +14,6 @@ router.use("/auth", authRouter);
 router.use(authenticated, authorizeRoles("teacher"));
 router.use("/profile", authRouter);
 router.use("/sessions", sessionsRouter);
+router.use("/", portalRouter);
 
 export default router;

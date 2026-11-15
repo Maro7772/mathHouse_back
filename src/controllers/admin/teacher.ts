@@ -6,6 +6,7 @@ import { SuccessResponse } from "../../utils/response";
 import { BadRequest } from "../../Errors/BadRequest";
 import { handleImageUpdate, validateAndSaveLogo, deleteImage } from "../../utils/handleImages";
 import { randomUUID } from "crypto";
+import { ancestorsOf } from "../../utils/categoryTree";
 
 export const createTeacher = async (req: Request, res: Response) => {
     const { name, email, phoneNumber, password, avatar, categoryId, courseIds } = req.body;
@@ -241,24 +242,10 @@ export const getCategorySelection = async (req: Request, res: Response) => {
 
     const leafCategories = allCategories.filter(cat => !parentIds.has(cat.id));
 
-    const formattedCategories = leafCategories.map(leaf => {
-        let current = leaf;
-        const ancestors: string[] = [];
-
-        while (current) {
-            ancestors.unshift(current.name);
-            if (current.parentCategoryId && categoryMap.has(current.parentCategoryId)) {
-                current = categoryMap.get(current.parentCategoryId)!;
-            } else {
-                break;
-            }
-        }
-
-        return {
-            id: leaf.id,
-            name: ancestors.join(" ")
-        };
-    });
+    const formattedCategories = leafCategories.map(leaf => ({
+        id: leaf.id,
+        name: [leaf, ...ancestorsOf(leaf, categoryMap)].reverse().map(c => c.name).join(" "),
+    }));
 
     return SuccessResponse(res, { message: "Categories fetched successfully", data: formattedCategories }, 200);
 }

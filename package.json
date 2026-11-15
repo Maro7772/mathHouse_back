@@ -11,6 +11,7 @@
     "migrate-db": "npx drizzle-kit push",
     "seed": "tsx src/seeds/index.ts",
     "seed:fresh": "tsx src/seeds/index.ts --fresh",
+    "seed:teacher-demo": "tsx src/seeds/teacherPortalDemo.ts",
     "start:prod": "node dist/src/server.js",
     "migrate-log": "node migrate.js",
     "reset-db": "tsx src/models/reset.ts"

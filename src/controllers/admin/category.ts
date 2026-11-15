@@ -6,6 +6,7 @@ import { SuccessResponse } from "../../utils/response";
 import { BadRequest } from "../../Errors/BadRequest";
 import { handleImageUpdate, validateAndSaveLogo } from "../../utils/handleImages";
 import { deleteImage } from "../../utils/handleImages";
+import { ancestorsOf } from "../../utils/categoryTree";
 
 export const createCategory = async (req: Request, res: Response) => {
     const { name, description, image, parentCategoryId } = req.body;
@@ -51,9 +52,18 @@ export const updateCategory = async (req: Request, res: Response) => {
     }
 
     if (parentCategoryId) {
-        const existingCategory = await db.select().from(category).where(eq(category.id, parentCategoryId));
-        if (existingCategory.length === 0) {
+        if (parentCategoryId === id) {
+            throw new BadRequest("A category cannot be its own parent");
+        }
+        const all = await db.select({ id: category.id, parentCategoryId: category.parentCategoryId }).from(category);
+        const byId = new Map(all.map(c => [c.id, c]));
+        const parent = byId.get(parentCategoryId);
+        if (!parent) {
             throw new BadRequest("Parent category not found");
+        }
+        // Moving a category under one of its own sub-categories would make a loop.
+        if (ancestorsOf(parent, byId).some(c => c.id === id)) {
+            throw new BadRequest("A category cannot be moved under one of its own sub-categories");
         }
     }
 
@@ -103,19 +113,7 @@ export const getAllCategory = async (req: Request, res: Response) => {
     });
 
     const data = categories.map(cat => {
-        const ancestors: { id: string, name: string, level: number }[] = [];
-        let current = cat;
-        let level = 1;
-
-        while (current.parentCategoryId) {
-            const parent = categoryMap.get(current.parentCategoryId);
-            if (parent) {
-                ancestors.push({ id: parent.id, name: parent.name, level: level++ });
-                current = parent;
-            } else {
-                break;
-            }
-        }
+        const ancestors = ancestorsOf(cat, categoryMap).map((p, i) => ({ id: p.id, name: p.name, level: i + 1 }));
 
         const isLeaf = !parentIds.has(cat.id);
 
@@ -145,19 +143,7 @@ export const getCategoryById = async (req: Request, res: Response) => {
     const categoryMap = new Map<string, typeof categories[0]>();
     categories.forEach((cat) => categoryMap.set(cat.id, cat));
 
-    const ancestors: { id: string; name: string; level: number }[] = [];
-    let current = existingCategory;
-    let level = 1;
-
-    while (current.parentCategoryId) {
-        const parent = categoryMap.get(current.parentCategoryId);
-        if (parent) {
-            ancestors.push({ id: parent.id, name: parent.name, level: level++ });
-            current = parent;
-        } else {
-            break;
-        }
-    }
+    const ancestors = ancestorsOf(existingCategory, categoryMap).map((p, i) => ({ id: p.id, name: p.name, level: i + 1 }));
 
     const data = {
         ...existingCategory,
@@ -188,6 +174,7 @@ export const getCategoryLineage = async (req: Request, res: Response) => {
             SELECT c.id, c.name, c.description, c.image, c.parent_category_id, c.created_at, c.updated_at, cp.level + 1
             FROM category c
             JOIN category_path cp ON c.id = cp.parent_category_id
+            WHERE cp.level < 20
         )
         SELECT * FROM category_path ORDER BY level;
     `;

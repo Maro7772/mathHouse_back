@@ -134,6 +134,48 @@
       "when": 1792403802131,
       "tag": "0018_fair_galactus",
       "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "5",
+      "when": 1794490776322,
+      "tag": "0019_teacher_portal",
+      "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "5",
+      "when": 1794492789292,
+      "tag": "0020_student_portal",
+      "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "5",
+      "when": 1794559768897,
+      "tag": "0021_planner",
+      "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "5",
+      "when": 1794561075207,
+      "tag": "0022_finance",
+      "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "5",
+      "when": 1794562468185,
+      "tag": "0023_enrolled_price_set_null",
+      "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "5",
+      "when": 1794730856648,
+      "tag": "0024_popup_active",
+      "breakpoints": true
     }
   ]
 }

@@ -1,0 +1,13 @@
+-- Fix: enrolledItems.expiresAt must be nullable (NULL = permanent access), as declared in
+-- src/models/schema/user/enrolledItems.ts.
+--
+-- The live table was created as
+--   `expiresAt` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+-- (MySQL's legacy timestamp defaults). Effects:
+--   * inserting NULL fails  → "Column 'expiresAt' cannot be null"
+--     (e.g. admin manual attendance / teacher attendance for sessions without contentAccessDays)
+--   * any UPDATE of an enrollment row silently resets expiresAt to the current time.
+--
+-- This only changes the column definition. Existing rows keep their current values; review
+-- them separately if some enrollments were meant to be permanent.
+ALTER TABLE `enrolledItems` MODIFY `expiresAt` timestamp NULL DEFAULT NULL;

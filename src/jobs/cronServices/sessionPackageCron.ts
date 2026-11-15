@@ -11,6 +11,7 @@ import {
 } from "../../models/schema/admin/Session";
 import { groupStudents } from "../../models/schema/admin/Groups";
 import { Student } from "../../models/schema/admin/Student";
+import { studentCancelRequests } from "../../models/schema/admin/studentPortal";
 import { eq, and, inArray, sql } from "drizzle-orm";
 
 /**
@@ -158,7 +159,9 @@ export async function processUpcomingSessionsDeductions(targetStudentId?: string
             .from(sessions)
             .where(and(
                 sql`${sessions.sessionDate} >= ${today}`,
-                sql`${sessions.sessionDate} <= ${dateLimitStr}`
+                sql`${sessions.sessionDate} <= ${dateLimitStr}`,
+                // cancelled sessions are never charged
+                sql`${sessions.status} != 'cancelled'`
             ));
 
         for (const session of candidateSessions) {
@@ -224,7 +227,20 @@ export async function processUpcomingSessionsDeductions(targetStudentId?: string
                 enrolledStudentIds = Array.from(studentSet);
             }
 
+            // Students whose cancel request for this session was accepted are not charged
+            const cancelledFor = enrolledStudentIds.length
+                ? new Set((await db
+                    .select({ studentId: studentCancelRequests.studentId })
+                    .from(studentCancelRequests)
+                    .where(and(
+                        eq(studentCancelRequests.sessionId, session.id),
+                        eq(studentCancelRequests.status, "accepted"),
+                        inArray(studentCancelRequests.studentId, enrolledStudentIds)
+                    ))).map(r => r.studentId))
+                : new Set<string>();
+
             for (const sId of enrolledStudentIds) {
+                if (cancelledFor.has(sId)) continue;
                 await deductSingleStudentSession(session.id, sId, session.sessionRelationalType);
             }
         }

@@ -1,4 +1,5 @@
 import { Request, Response } from "express";
+import { syncPricePlans } from "../../utils/pricePlans";
 import { db } from "../../models/connection";
 import { chapters, courses, category, teachers, lessons, lessonIdeas, semesters, prices } from "../../models/schema";
 import { eq, max, asc, and, gt, sql, inArray } from "drizzle-orm";
@@ -330,22 +331,9 @@ export const updateChapter = async (req: Request, res: Response) => {
         }).where(eq(chapters.id, id));
 
         // Update Price Plans
+        // Plans are updated in place (they keep their ids) so enrolments that point at them are never lost.
         if (pricePlans && pricePlans.length > 0) {
-            await tx.delete(prices).where(and(eq(prices.targetId, id), eq(prices.targetType, "chapter")));
-            const priceValues = pricePlans.map((plan: any, index: number) => ({
-                id: randomUUID(),
-                targetId: id,
-                targetType: "chapter" as const,
-                durationLabel: plan.label,
-                durationDays: plan.days,
-                priceEgp: plan.priceEgp,
-                priceUsd: plan.priceUsd,
-                discountEgp: plan.discountEgp || "0.00",
-                discountUsd: plan.discountUsd || "0.00",
-                hasDiscount: plan.hasDiscount || false,
-                isDefault: index === 0,
-            }));
-            await tx.insert(prices).values(priceValues);
+            await syncPricePlans(tx, "chapter", id, pricePlans);
         }
     });
 

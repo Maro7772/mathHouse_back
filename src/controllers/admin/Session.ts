@@ -23,6 +23,7 @@ import { NotFound } from "../../Errors";
 import { validateAndSavePdf, deleteImage } from "../../utils/handleImages";
 import { resolveSessionMaterials, emptySessionMaterials } from "../../utils/sessionMaterials";
 import { generateMistakesPdfs } from "../../utils/mistakesGenerator";
+import { getLessonIdsBySession, markStudentPresent } from "../../utils/sessionAttendance";
 
 // Selections
 export const selectCategory = async (req: Request, res: Response) => {
@@ -124,6 +125,9 @@ export const selectStudents = async (req: Request, res: Response) => {
                 like(Student.lastname, `%${d_search}%`),
                 like(Student.email, `%${d_search}%`),
                 like(Student.phone, `%${d_search}%`),
+                // full name ("Nada Medhat") and nickname, not only first or last name on their own
+                like(sql`CONCAT(${Student.firstname}, ' ', ${Student.lastname})`, `%${d_search.trim()}%`),
+                like(Student.nickname, `%${d_search}%`),
             )
         );
     }
@@ -399,6 +403,7 @@ export const createSession = async (req: Request, res: Response) => {
         const groupStudentsList = await db
             .select({ studentId: groupStudents.studentId })
             .from(groupStudents)
+            .innerJoin(Student, eq(Student.id, groupStudents.studentId)) // skip links to deleted students
             .where(inArray(groupStudents.groupId, groupIds));
         groupStudentsList.forEach(gs => uniqueStudentIds.add(gs.studentId));
     }
@@ -573,6 +578,11 @@ export const getAllSessions = async (req: Request, res: Response) => {
         session_pdf: sessions.session_pdf,
         session_answers_pdf: sessions.session_answers_pdf,
         teacher_explanation_pdf: sessions.teacher_explanation_pdf,
+        status: sessions.status,
+        cancelReason: sessions.cancelReason,
+        cancelledBy: sessions.cancelledBy,
+        cancelledAt: sessions.cancelledAt,
+        confirmedAt: sessions.confirmedAt,
         createdAt: sessions.createdAt,
         updatedAt: sessions.updatedAt,
         teacher: {
@@ -906,6 +916,7 @@ export const regenerateMistakesSessionPdfs = async (req: Request, res: Response)
         const groupStudentRows = await db
             .select({ studentId: groupStudents.studentId })
             .from(groupStudents)
+            .innerJoin(Student, eq(Student.id, groupStudents.studentId)) // skip links to deleted students
             .where(inArray(groupStudents.groupId, groupIds));
         groupStudentRows.forEach(row => studentIds.add(row.studentId));
     }
@@ -1145,6 +1156,7 @@ export const updateSession = async (req: Request, res: Response) => {
             const groupStudentsList = await db
                 .select({ studentId: groupStudents.studentId })
                 .from(groupStudents)
+                .innerJoin(Student, eq(Student.id, groupStudents.studentId)) // skip links to deleted students
                 .where(inArray(groupStudents.groupId, groupIds));
             groupStudentsList.forEach(gs => uniqueStudentIds!.add(gs.studentId));
         }
@@ -1719,22 +1731,8 @@ export const manualAttendSessions = async (req: Request, res: Response) => {
         throw new NotFound("None of the specified sessions were found");
     }
 
-    // Fetch lessons for all target sessions
-    const allSessionLessons = await db
-        .select({
-            sessionId: sessionLessons.sessionId,
-            lessonId: sessionLessons.lessonId,
-        })
-        .from(sessionLessons)
-        .where(inArray(sessionLessons.sessionId, existingSessions.map(s => s.id)));
-
-    const lessonsBySession = new Map<string, string[]>();
-    for (const row of allSessionLessons) {
-        if (!lessonsBySession.has(row.sessionId)) {
-            lessonsBySession.set(row.sessionId, []);
-        }
-        lessonsBySession.get(row.sessionId)!.push(row.lessonId);
-    }
+    // Lessons for all target sessions
+    const lessonsBySession = await getLessonIdsBySession(existingSessions.map(s => s.id));
 
     const attendanceResults: any[] = [];
 
@@ -1747,134 +1745,13 @@ export const manualAttendSessions = async (req: Request, res: Response) => {
             for (const session of existingSessions) {
                 const sessionLessonIds = lessonsBySession.get(session.id) || [];
 
-                // 1. Ensure enrollment in sessionUsers so student history and details queries include it
-                const [existingSessionUser] = await tx
-                    .select({ id: sessionUsers.id })
-                    .from(sessionUsers)
-                    .where(and(
-                        eq(sessionUsers.sessionId, session.id),
-                        eq(sessionUsers.studentId, student.id)
-                    ))
-                    .limit(1);
+                // Enrollment, attendance, balance deduction and lesson unlock (shared with the teacher portal)
+                const { balanceDeducted, lessonsUnlocked: unlockedLessonsCount } =
+                    await markStudentPresent(tx, student.id, session, sessionLessonIds);
 
-                if (!existingSessionUser) {
-                    await tx.insert(sessionUsers).values({
-                        id: randomUUID(),
-                        sessionId: session.id,
-                        studentId: student.id,
-                    });
-                }
-
-                // 2. Upsert sessionAttendance to "present"
-                const [existingAttendance] = await tx
-                    .select({ id: sessionAttendance.id, status: sessionAttendance.status })
-                    .from(sessionAttendance)
-                    .where(and(
-                        eq(sessionAttendance.sessionId, session.id),
-                        eq(sessionAttendance.studentId, student.id)
-                    ))
-                    .limit(1);
-
-                const attendedAt = new Date();
-                if (existingAttendance) {
-                    await tx.update(sessionAttendance)
-                        .set({ status: "present", attendedAt })
-                        .where(eq(sessionAttendance.id, existingAttendance.id));
-                } else {
-                    await tx.insert(sessionAttendance).values({
-                        id: randomUUID(),
-                        sessionId: session.id,
-                        studentId: student.id,
-                        status: "present",
-                        attendedAt,
-                    });
-                }
-
-                // 3. Balance deduction logic (re-explanation exempt check + prevent double deduction)
-                const [existingDeduction] = await tx
-                    .select({ id: sessionPackageDeductions.id })
-                    .from(sessionPackageDeductions)
-                    .where(and(
-                        eq(sessionPackageDeductions.sessionId, session.id),
-                        eq(sessionPackageDeductions.studentId, student.id)
-                    ))
-                    .limit(1);
-
-                let balanceDeducted = false;
-
-                if (!existingDeduction) {
-                    let shouldDeduct = true;
-
-                    // Re-Explanation: free if student attended all lessons previously in other sessions
-                    if (session.sessionRelationalType === "Re-Explanation" && sessionLessonIds.length > 0) {
-                        const previouslyAttendedRows = await tx
-                            .select({ lessonId: sessionLessons.lessonId })
-                            .from(sessionAttendance)
-                            .innerJoin(sessionLessons, eq(sessionAttendance.sessionId, sessionLessons.sessionId))
-                            .where(and(
-                                eq(sessionAttendance.studentId, student.id),
-                                eq(sessionAttendance.status, "present"),
-                                sql`${sessionAttendance.sessionId} != ${session.id}`,
-                                inArray(sessionLessons.lessonId, sessionLessonIds)
-                            ));
-
-                        const attendedLessonIdSet = new Set(previouslyAttendedRows.map(r => r.lessonId));
-                        if (sessionLessonIds.every(id => attendedLessonIdSet.has(id))) {
-                            shouldDeduct = false;
-                        }
-                    }
-
-                    if (shouldDeduct) {
-                        await tx
-                            .update(Student)
-                            .set({ livebalance: sql`GREATEST(0, ${Student.livebalance} - 1)` })
-                            .where(eq(Student.id, student.id));
-
-                        await tx.insert(sessionPackageDeductions).values({
-                            id: randomUUID(),
-                            sessionId: session.id,
-                            studentId: student.id,
-                            deductedAt: new Date(),
-                        }).catch(() => {});
-
-                        balanceDeducted = true;
-                        totalDeductionsForStudent += 1;
-                        currentLiveBalance = Math.max(0, currentLiveBalance - 1);
-                    }
-                }
-
-                // 4. Unlock session lessons in enrolledItems
-                let unlockedLessonsCount = 0;
-                if (sessionLessonIds.length > 0) {
-                    const alreadyEnrolled = await tx
-                        .select({ lessonId: enrolledItems.lessonId })
-                        .from(enrolledItems)
-                        .where(and(
-                            eq(enrolledItems.studentId, student.id),
-                            eq(enrolledItems.status, "active"),
-                            inArray(enrolledItems.lessonId, sessionLessonIds)
-                        ));
-
-                    const enrolledLessonIdSet = new Set(alreadyEnrolled.map(r => r.lessonId).filter(Boolean));
-
-                    const expiresAt = session.contentAccessDays
-                        ? new Date(Date.now() + session.contentAccessDays * 24 * 60 * 60 * 1000)
-                        : null;
-
-                    const newEnrollments = sessionLessonIds
-                        .filter(id => !enrolledLessonIdSet.has(id))
-                        .map(lessonId => ({
-                            id: randomUUID(),
-                            studentId: student.id,
-                            lessonId,
-                            status: "active" as const,
-                            expiresAt,
-                        }));
-
-                    if (newEnrollments.length > 0) {
-                        await tx.insert(enrolledItems).values(newEnrollments);
-                        unlockedLessonsCount = newEnrollments.length;
-                    }
+                if (balanceDeducted) {
+                    totalDeductionsForStudent += 1;
+                    currentLiveBalance = Math.max(0, currentLiveBalance - 1);
                 }
 
                 attendedSessionsList.push({

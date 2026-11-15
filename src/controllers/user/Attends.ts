@@ -223,6 +223,9 @@ export const getUpcomingSessions = async (req: Request, res: Response) => {
             sessionLink: sessions.session_link,
             sessionRelationalType: sessions.sessionRelationalType,
             teacher_explanation_pdf: sessions.teacher_explanation_pdf,
+            status: sessions.status,
+            cancelReason: sessions.cancelReason,
+            teacherName: teachers.name,
             attendanceStatus: sessionAttendance.status,
             attendedAt: sessionAttendance.attendedAt,
             lesson: {
@@ -239,6 +242,7 @@ export const getUpcomingSessions = async (req: Request, res: Response) => {
             },
         })
         .from(sessions)
+        .leftJoin(teachers, eq(sessions.teacherId, teachers.id))
         .leftJoin(sessionAttendance, and(
             eq(sessionAttendance.sessionId, sessions.id),
             eq(sessionAttendance.studentId, studentId)
@@ -275,6 +279,9 @@ export const getUpcomingSessions = async (req: Request, res: Response) => {
                 sessionLink: row.sessionLink,
                 sessionRelationalType: row.sessionRelationalType,
                 teacher_explanation_pdf: row.teacher_explanation_pdf,
+                status: row.status,
+                cancelReason: row.cancelReason,
+                teacherName: row.teacherName,
                 attendanceStatus: row.attendanceStatus || "not_marked",
                 attendedAt: row.attendedAt,
                 lessons: [],
@@ -314,6 +321,9 @@ export const getUpcomingSessions = async (req: Request, res: Response) => {
             timeTo: s.timeTo,
             sessionLink: s.sessionLink,
             sessionRelationalType: s.sessionRelationalType,
+            status: s.status,
+            cancelReason: s.cancelReason,
+            teacherName: s.teacherName,
             attendanceStatus: s.attendanceStatus,
             attendedAt: s.attendedAt,
             ...pdfData,
@@ -344,6 +354,9 @@ export const getSessionHistory = async (req: Request, res: Response) => {
             materialLink: sessions.material_link,
             sessionRelationalType: sessions.sessionRelationalType,
             teacher_explanation_pdf: sessions.teacher_explanation_pdf,
+            status: sessions.status,
+            cancelReason: sessions.cancelReason,
+            teacherName: teachers.name,
             attendanceStatus: sessionAttendance.status,
             attendedAt: sessionAttendance.attendedAt,
             lesson: {
@@ -363,6 +376,7 @@ export const getSessionHistory = async (req: Request, res: Response) => {
             },
         })
         .from(sessions)
+        .leftJoin(teachers, eq(sessions.teacherId, teachers.id))
         .leftJoin(sessionAttendance, and(
             eq(sessionAttendance.sessionId, sessions.id),
             eq(sessionAttendance.studentId, studentId)
@@ -397,6 +411,9 @@ export const getSessionHistory = async (req: Request, res: Response) => {
                 materialLink: row.materialLink,
                 sessionRelationalType: row.sessionRelationalType,
                 teacher_explanation_pdf: row.teacher_explanation_pdf,
+                status: row.status,
+                cancelReason: row.cancelReason,
+                teacherName: row.teacherName,
                 attendanceStatus: row.attendanceStatus || "not_marked",
                 attendedAt: row.attendedAt,
                 lessons: [],
@@ -450,6 +467,9 @@ export const getSessionHistory = async (req: Request, res: Response) => {
             sessionLink: s.sessionLink,
             materialLink: s.materialLink,
             sessionRelationalType: s.sessionRelationalType,
+            status: s.status,
+            cancelReason: s.cancelReason,
+            teacherName: s.teacherName,
             attendanceStatus: s.attendanceStatus,
             attendedAt: s.attendedAt,
             ...pdfData,
@@ -596,11 +616,13 @@ export const joinSession = async (req: Request, res: Response) => {
             timeTo: sessions.timeTo,
             sessionLink: sessions.session_link,
             sessionRelationalType: sessions.sessionRelationalType,
+            status: sessions.status,
         })
         .from(sessions)
         .where(eq(sessions.id, sessionId));
 
     if (!session) throw new NotFound("Session not found");
+    if (session.status === "cancelled") throw new BadRequest("This session was cancelled");
 
     if (!(await isEnrolled(studentId, sessionId))) {
         throw new NotFound("You are not enrolled in this session");

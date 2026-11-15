@@ -47,9 +47,8 @@ export const getExams = async (req: Request, res: Response) => {
     // -- Upwards: Get current category + all ancestors (Parents)
     let currentId: string | null = student.categoryId;
     while (currentId) {
-        if (!categoryIds.includes(currentId)) {
-            categoryIds.push(currentId);
-        }
+        if (categoryIds.includes(currentId)) break; // category parent loop (A → B → A) — stop instead of looping forever
+        categoryIds.push(currentId);
         const [cat]: any = await db
             .select({ parentCategoryId: category.parentCategoryId })
             .from(category)
@@ -232,7 +231,8 @@ export const getExamById = async (req: Request, res: Response) => {
 
     // Get Ancestors (Parents)
     while (currentCategoryId) {
-        if (!categoryIds.includes(currentCategoryId)) categoryIds.push(currentCategoryId);
+        if (categoryIds.includes(currentCategoryId)) break; // category parent loop (A → B → A) — stop instead of looping forever
+        categoryIds.push(currentCategoryId);
         const [cat]: any = await db
             .select({ parentCategoryId: category.parentCategoryId })
             .from(category)
@@ -386,7 +386,8 @@ export const startExam = async (req: Request, res: Response) => {
     let currentCategoryId: string | null = student.categoryId;
 
     while (currentCategoryId) {
-        if (!categoryIds.includes(currentCategoryId)) categoryIds.push(currentCategoryId);
+        if (categoryIds.includes(currentCategoryId)) break; // category parent loop (A → B → A) — stop instead of looping forever
+        categoryIds.push(currentCategoryId);
         const [cat]: any = await db
             .select({ parentCategoryId: category.parentCategoryId })
             .from(category)

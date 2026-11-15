@@ -1,7 +1,7 @@
 import { Request, Response } from "express";
 import { db } from "../../models/connection";
 import { popups } from "../../models/schema/admin/Popup";
-import { eq, and, gte, lte } from "drizzle-orm";
+import { eq, and, gt, lte } from "drizzle-orm";
 import { SuccessResponse } from "../../utils/response";
 import { BadRequest } from "../../Errors/BadRequest";
 import { NotFound } from "../../Errors";
@@ -10,8 +10,28 @@ import { randomUUID } from "crypto";
 
 // ===================== CRUD =====================
 
+/** "true"/"false"/1/0/boolean → boolean; anything else → undefined (not sent). */
+const toBool = (v: any): boolean | undefined =>
+    v === true || v === "true" || v === 1 || v === "1" ? true
+        : v === false || v === "false" || v === 0 || v === "0" ? false
+            : undefined;
+
+/** The end date is a calendar day saved as its midnight: the popup keeps showing for that whole day. */
+const DAY_MS = 24 * 60 * 60 * 1000;
+const endsAt = (endDate: Date | string) => new Date(new Date(endDate).getTime() + DAY_MS);
+
+/** isActive = the admin's on/off switch; status/isLive = what that means today.
+    A popup shows until its end date is over or until it is switched off — whichever comes first. */
+const withStatus = (p: typeof popups.$inferSelect, now = new Date()) => {
+    const started = new Date(p.startDate) <= now;
+    const ended = endsAt(p.endDate) <= now;
+    const status = !p.isActive ? "inactive" : ended ? "ended" : started ? "live" : "scheduled";
+    return { ...p, isActive: !!p.isActive, isLive: status === "live", status };
+};
+
 export const createPopup = async (req: Request, res: Response) => {
     const { name, image, destination, startDate, endDate } = req.body;
+    const isActive = toBool(req.body.isActive) ?? true;
 
     if (!name || !image || !destination || !startDate || !endDate) {
         throw new BadRequest("Name, image, destination, start date and end date are required");
@@ -30,6 +50,7 @@ export const createPopup = async (req: Request, res: Response) => {
         destination,
         startDate: new Date(startDate),
         endDate: new Date(endDate),
+        isActive,
     });
 
     return SuccessResponse(res, { message: "Popup created successfully" }, 201);
@@ -39,10 +60,7 @@ export const getAllPopups = async (req: Request, res: Response) => {
     const allPopups = await db.select().from(popups);
 
     const now = new Date();
-    const result = allPopups.map(p => ({
-        ...p,
-        isActive: new Date(p.endDate) >= now && new Date(p.startDate) <= now,
-    }));
+    const result = allPopups.map(p => withStatus(p, now));
 
     return SuccessResponse(res, { popups: result }, 200);
 };
@@ -55,18 +73,13 @@ export const getPopupById = async (req: Request, res: Response) => {
         throw new NotFound("Popup not found");
     }
 
-    const now = new Date();
-    const result = {
-        ...popup[0],
-        isActive: new Date(popup[0].endDate) >= now && new Date(popup[0].startDate) <= now,
-    };
-
-    return SuccessResponse(res, { popup: result }, 200);
+    return SuccessResponse(res, { popup: withStatus(popup[0]) }, 200);
 };
 
 export const updatePopup = async (req: Request, res: Response) => {
     const { id } = req.params;
     const { name, image, destination, startDate, endDate } = req.body;
+    const isActive = toBool(req.body.isActive);
 
     const existing = await db.select().from(popups).where(eq(popups.id, id));
     if (existing.length === 0) {
@@ -85,6 +98,7 @@ export const updatePopup = async (req: Request, res: Response) => {
         ...(destination && { destination }),
         ...(startDate && { startDate: new Date(startDate) }),
         ...(endDate && { endDate: new Date(endDate) }),
+        ...(isActive !== undefined && { isActive }),
     }).where(eq(popups.id, id));
 
     return SuccessResponse(res, { message: "Popup updated successfully" }, 200);
@@ -124,8 +138,9 @@ export const getActivePopups = async (req: Request, res: Response) => {
         .where(
             and(
                 eq(popups.destination, destination as "student" | "parent" | "teacher"),
+                eq(popups.isActive, true),
                 lte(popups.startDate, now),
-                gte(popups.endDate, now)
+                gt(popups.endDate, new Date(now.getTime() - DAY_MS)) // still within the whole end day
             )
         );
 

@@ -30,6 +30,19 @@ export type DateRangeResult = {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Helpers: calendar days in the server's local timezone. MySQL DATE columns arrive as Date objects
+// (local midnight); String(date).slice(0, 10) would give "Sat Nov 07", never "2026-11-07".
+// ─────────────────────────────────────────────────────────────────────────────
+function ymdLocal(d: Date): string {
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+function dayKey(v: unknown): string | null {
+    if (!v) return null;
+    if (v instanceof Date) return Number.isNaN(v.getTime()) ? null : ymdLocal(v);
+    return String(v).slice(0, 10);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Helper: format Day label (e.g. "Wed 21")
 // ─────────────────────────────────────────────────────────────────────────────
 function formatDayLabel(d: Date): string {
@@ -200,22 +213,17 @@ export const getDashboard = async (req: Request, res: Response) => {
         vsPreviousLabel,
     } = resolveDateRange(req.query);
 
-    const startStr = startDate.toISOString().slice(0, 10);
-    const endStr = endDate.toISOString().slice(0, 10);
-    const prevStartStr = prevStartDate.toISOString().slice(0, 10);
-    const prevEndStr = prevEndDate.toISOString().slice(0, 10);
+    // Local (server timezone) calendar days — toISOString() would shift them to UTC (a day early in Cairo).
+    const startStr = ymdLocal(startDate);
+    const endStr = ymdLocal(endDate);
+    const prevStartStr = ymdLocal(prevStartDate);
+    const prevEndStr = ymdLocal(prevEndDate);
 
-    const sessionDateFilter = sql`(
-        (${sessions.scheduleType} = 'once'   AND ${sessions.sessionDate} BETWEEN ${startStr} AND ${endStr})
-        OR
-        (${sessions.scheduleType} = 'repeat' AND ${sessions.startDate} <= ${endStr} AND ${sessions.endDate} >= ${startStr})
-    )`;
-
-    const prevSessionDateFilter = sql`(
-        (${sessions.scheduleType} = 'once'   AND ${sessions.sessionDate} BETWEEN ${prevStartStr} AND ${prevEndStr})
-        OR
-        (${sessions.scheduleType} = 'repeat' AND ${sessions.startDate} <= ${prevEndStr} AND ${sessions.endDate} >= ${prevStartStr})
-    )`;
+    // Every session row is one dated occurrence (repeating sessions are stored one row per date with
+    // session_date set), so the row's own date decides the range. Cancelled sessions don't count.
+    const SESSION_DAY = sql`COALESCE(${sessions.sessionDate}, ${sessions.startDate})`;
+    const sessionDateFilter = sql`(${sessions.status} = 'scheduled' AND ${SESSION_DAY} BETWEEN ${startStr} AND ${endStr})`;
+    const prevSessionDateFilter = sql`(${sessions.status} = 'scheduled' AND ${SESSION_DAY} BETWEEN ${prevStartStr} AND ${prevEndStr})`;
 
     // ── 1. Sessions in range ────────────────────────────────────────────────
     const sessionList = await db
@@ -313,29 +321,16 @@ export const getDashboard = async (req: Request, res: Response) => {
     dayCursor.setHours(0, 0, 0, 0);
 
     while (dayCursor <= endDate) {
-        dayMap.set(dayCursor.toISOString().slice(0, 10), { sessions: 0 });
+        dayMap.set(ymdLocal(dayCursor), { sessions: 0 });
         dayCursor.setDate(dayCursor.getDate() + 1);
     }
 
     const sessionDateMap = new Map<string, string>(); // sessionId -> YYYY-MM-DD
     for (const sess of sessionList) {
-        if (sess.scheduleType === "once" && sess.sessionDate) {
-            const key = String(sess.sessionDate).slice(0, 10);
-            if (dayMap.has(key)) dayMap.get(key)!.sessions += 1;
-            sessionDateMap.set(sess.id, key);
-        } else if (sess.scheduleType === "repeat" && sess.startDate && sess.endDate) {
-            const sDate = new Date(String(sess.startDate));
-            const eDate = new Date(String(sess.endDate));
-            const cur = new Date(Math.max(sDate.getTime(), startDate.getTime()));
-            cur.setHours(0, 0, 0, 0);
-            const bound = new Date(Math.min(eDate.getTime(), endDate.getTime()));
-            while (cur <= bound) {
-                const key = cur.toISOString().slice(0, 10);
-                if (dayMap.has(key)) dayMap.get(key)!.sessions += 1;
-                cur.setDate(cur.getDate() + 1);
-            }
-            sessionDateMap.set(sess.id, String(sess.startDate).slice(0, 10));
-        }
+        const key = dayKey(sess.sessionDate ?? sess.startDate);
+        if (!key) continue;
+        if (dayMap.has(key)) dayMap.get(key)!.sessions += 1;
+        sessionDateMap.set(sess.id, key);
     }
 
     const dayStudentMap = new Map<string, Set<string>>();

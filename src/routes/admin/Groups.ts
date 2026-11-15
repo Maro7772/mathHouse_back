@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { getGroupsOverview } from "../../controllers/admin/store";
 import {
     createGroup, deleteGroup,
     getAllGroups, getGroupById, updateGroup, searchStudents, selectOptions
@@ -10,6 +11,7 @@ const router = Router();
 
 router.get("/select", requirePermission("groups", "View"), catchAsync(selectOptions));
 router.get("/search-students", requirePermission("groups", "View"), catchAsync(searchStudents));
+router.get("/overview", requirePermission("groups", "View"), catchAsync(getGroupsOverview));
 router.get("/", requirePermission("groups", "View"), catchAsync(getAllGroups));
 router.get("/:id", requirePermission("groups", "View"), catchAsync(getGroupById));
 router.post("/", requirePermission("groups", "Add"), catchAsync(createGroup));

@@ -2,6 +2,7 @@ import { Request, Response } from "express";
 import { db } from "../../models/connection";
 import { category, Student, wallet, walletTransaction, grade as gradeTable, courses, chapters, lessons, enrolledItems, prices, packages, paymentMethod, payment, parents, examAttempts, Exams, notes } from "../../models/schema";
 import { studentAvailabilityPlans, studentAvailabilitySlots } from "../../models/schema/admin/StudentAvailabilityPlan";
+import { groupStudents } from "../../models/schema/admin/Groups";
 import { eq, or, like, isNull, and, inArray, isNotNull, sql, gt, desc } from "drizzle-orm";
 import { SuccessResponse } from "../../utils/response";
 import { NotFound } from "../../Errors/NotFound";
@@ -478,6 +479,8 @@ export const deleteStudent = async (req: Request, res: Response) => {
         await deleteImage(student[0].avatar);
     }
     await db.delete(wallet).where(eq(wallet.studentId, id));
+    // group_students has no FK on student_id — remove the links so the group never points at a missing student.
+    await db.delete(groupStudents).where(eq(groupStudents.studentId, id));
     await db.delete(Student).where(eq(Student.id, id));
 
     SuccessResponse(res, { message: "delete student success" });
@@ -945,9 +948,41 @@ export const attendItems = async (req: Request, res: Response) => {
         .from(enrolledItems)
         .where(eq(enrolledItems.studentId, id));
 
-    const hasCourse = (cId: string) => existingEnrollments.some(e => e.courseId === cId && !e.chapterId && !e.lessonId);
-    const hasChapter = (chId: string) => existingEnrollments.some(e => e.chapterId === chId && !e.lessonId);
-    const hasLesson = (lId: string) => existingEnrollments.some(e => e.lessonId === lId);
+    // Rows for exactly this course / chapter / lesson (not the inherited ones).
+    const isCourseRow = (e: any, cId: string) => e.courseId === cId && !e.chapterId && !e.lessonId;
+    const isChapterRow = (e: any, chId: string) => e.chapterId === chId && !e.lessonId;
+    const isLessonRow = (e: any, lId: string) => e.lessonId === lId;
+
+    // ── Switch OFF (action "unenroll"): remove the student's access to exactly these items.
+    //    Admin-granted rows (no payment) are deleted; paid rows are ended (expired now) so the purchase trail stays.
+    if (req.body.action === "unenroll") {
+        const targets = existingEnrollments.filter((e) =>
+            e.status === "active" && (
+                courseItems.some((i: any) => isCourseRow(e, i.id))
+                || chapterItems.some((i: any) => isChapterRow(e, i.id))
+                || lessonItems.some((i: any) => isLessonRow(e, i.id))));
+        if (targets.length === 0) {
+            return SuccessResponse(res, { message: "Nothing to remove — the student isn't enrolled in this item directly", data: { removed: 0 } });
+        }
+        const toDelete = targets.filter((e) => !e.paymentId).map((e) => e.id);
+        const toEnd = targets.filter((e) => e.paymentId).map((e) => e.id);
+        await db.transaction(async (tx) => {
+            if (toDelete.length) await tx.delete(enrolledItems).where(inArray(enrolledItems.id, toDelete));
+            if (toEnd.length) await tx.update(enrolledItems).set({ status: "expired", expiresAt: new Date() }).where(inArray(enrolledItems.id, toEnd));
+        });
+        return SuccessResponse(res, {
+            message: "Enrollment removed",
+            data: { student: { id: student.id, name: `${student.firstname} ${student.lastname}` }, removed: targets.length },
+        });
+    }
+
+    // Only active rows count as "already enrolled"; an expired/pending row for the same item is re-activated below.
+    const activeEnrollments = existingEnrollments.filter((e) => e.status === "active");
+    const hasCourse = (cId: string) => activeEnrollments.some(e => isCourseRow(e, cId));
+    const hasChapter = (chId: string) => activeEnrollments.some(e => isChapterRow(e, chId));
+    const hasLesson = (lId: string) => activeEnrollments.some(e => isLessonRow(e, lId));
+    const inactiveRowFor = (type: "course" | "chapter" | "lesson", itemId: string) => existingEnrollments.find((e) =>
+        e.status !== "active" && (type === "course" ? isCourseRow(e, itemId) : type === "chapter" ? isChapterRow(e, itemId) : isLessonRow(e, itemId)));
 
     // 🚀 جلب خطط الأسعار لحساب تاريخ الصلاحية (expiresAt)
     const explicitPriceIds = [
@@ -1125,8 +1160,33 @@ export const attendItems = async (req: Request, res: Response) => {
         }
     }
 
+    // An expired/pending row for the same item is re-activated instead of adding a second row.
+    const reactivate: { id: string; priceId: any; expiresAt: any }[] = [];
+    for (let i = enrollmentValues.length - 1; i >= 0; i--) {
+        const v = enrollmentValues[i];
+        const type = v.lessonId ? "lesson" : v.chapterId ? "chapter" : "course";
+        const old = inactiveRowFor(type, v.lessonId || v.chapterId || v.courseId);
+        if (old) {
+            reactivate.push({ id: old.id, priceId: v.priceId, expiresAt: v.expiresAt });
+            enrollmentValues.splice(i, 1);
+        }
+    }
+    if (reactivate.length) {
+        await db.transaction(async (tx) => {
+            for (const r of reactivate) {
+                await tx.update(enrolledItems).set({ status: "active", priceId: r.priceId, expiresAt: r.expiresAt }).where(eq(enrolledItems.id, r.id));
+            }
+        });
+    }
+
     // 7. تنفيذ عملية الحفظ في الداتابيز
     if (enrollmentValues.length === 0) {
+        if (reactivate.length) {
+            return SuccessResponse(res, {
+                message: "Student enrolled successfully",
+                data: { student: { id: student.id, name: `${student.firstname} ${student.lastname}` }, enrolledCount: reactivate.length },
+            });
+        }
         return SuccessResponse(res, {
             message: "No new items to enroll (All selected items are already inherited or enrolled)",
             data: { enrolled: 0 }

@@ -22,6 +22,9 @@ import {
 import { catchAsync } from "../../utils/catchAsync";
 import { requirePermission } from "../../middlewares/requirePermission";
 import { selectionLessons } from "../../controllers/admin/lessons";
+import { cancelSession, restoreSession, listCancelledSessions } from "../../controllers/admin/teacherRequests";
+import { validate } from "../../middlewares/validation";
+import { cancelSessionSchema } from "../../validation/teacher/portal";
 
 const router = Router();
 
@@ -35,12 +38,15 @@ router.get("/select/teachers", requirePermission("sessions", "View"), catchAsync
 router.get("/select/groups", requirePermission("sessions", "View"), catchAsync(selectGroups));
 router.post("/students/attendance", requirePermission("sessions", "View"), catchAsync(getStudentsCourseAttendance));
 
+router.get("/cancelled", requirePermission("sessions", "View"), catchAsync(listCancelledSessions));
 router.get("/", requirePermission("sessions", "View"), catchAsync(getAllSessions));
 router.post("/", requirePermission("sessions", "Add"), catchAsync(createSession));
 router.post("/manual-attendance", requirePermission("sessions", "Edit"), catchAsync(manualAttendSessions));
 router.get("/:id", requirePermission("sessions", "View"), catchAsync(getSessionById));
 router.post("/:id/generate-mistakes", requirePermission("sessions", "Edit"), catchAsync(regenerateMistakesSessionPdfs));
 router.put("/:id", requirePermission("sessions", "Edit"), catchAsync(updateSession));
+router.patch("/:id/cancel", requirePermission("sessions", "Edit"), validate(cancelSessionSchema), catchAsync(cancelSession));
+router.patch("/:id/restore", requirePermission("sessions", "Edit"), catchAsync(restoreSession));
 router.delete("/:id", requirePermission("sessions", "Delete"), catchAsync(deleteSession));
 
 router.get("/course/:courseId/lessons", requirePermission("sessions", "View"), catchAsync(selectionLessons));

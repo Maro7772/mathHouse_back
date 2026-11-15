@@ -32,12 +32,17 @@ export const createParent = async (req: Request, res: Response) => {
     if(studentIds && Array.isArray(studentIds) && studentIds.length > 0){
         uniqueStudentIds = [...new Set(studentIds)] as string[];
         const existingStudents = await db
-            .select({ id: Student.id })
+            .select({ id: Student.id, firstname: Student.firstname, lastname: Student.lastname, parentphone: Student.parentphone })
             .from(Student)
             .where(inArray(Student.id, uniqueStudentIds));
-        
+
         if(existingStudents.length !== uniqueStudentIds.length){
             throw new BadRequest("One or more students not found");
+        }
+        // Same rule as edit: a student already linked to another parent isn't silently moved.
+        const taken = existingStudents.find((s) => s.parentphone && s.parentphone.trim() !== "" && s.parentphone !== phoneNumber);
+        if (taken) {
+            throw new BadRequest(`${`${taken.firstname || ""} ${taken.lastname || ""}`.trim() || "A student"} is already linked to another parent`);
         }
     }
 
@@ -97,7 +102,16 @@ export const getParentById = async (req: Request, res: Response) => {
         throw new NotFound("parent not found");
     }
 
-    return SuccessResponse(res,  {message:"get parent by id success", data: parent[0]});
+    // Students are linked to a parent by the parent's phone number (student.parentphone).
+    const linked = parent[0].phoneNumber
+        ? await db
+            .select({ id: Student.id, firstname: Student.firstname, lastname: Student.lastname, nickname: Student.nickname, email: Student.email })
+            .from(Student)
+            .where(eq(Student.parentphone, parent[0].phoneNumber))
+        : [];
+    const students = linked.map((s) => ({ id: s.id, name: `${s.firstname || ""} ${s.lastname || ""}`.trim(), nickname: s.nickname || "", email: s.email || "" }));
+
+    return SuccessResponse(res,  {message:"get parent by id success", data: { ...parent[0], students, studentIds: students.map((s) => s.id) }});
 };
 
 export const updateParent = async (req: Request, res: Response) => {
@@ -133,9 +147,11 @@ export const updateParent = async (req: Request, res: Response) => {
         if (uniqueStudentIds.length > 0) {
             // جلب الطلاب المطلوبين للتأكد من وجودهم ومن حالات ربطهم الحالية
             const studentsInDb = await db
-                .select({ 
-                    id: Student.id, 
-                    parentphone: Student.parentphone 
+                .select({
+                    id: Student.id,
+                    firstname: Student.firstname,
+                    lastname: Student.lastname,
+                    parentphone: Student.parentphone
                 })
                 .from(Student)
                 .where(inArray(Student.id, uniqueStudentIds));
@@ -152,7 +168,7 @@ export const updateParent = async (req: Request, res: Response) => {
                     student.parentphone.trim() !== "" && 
                     student.parentphone !== currentParentPhone
                 ) {
-                    throw new BadRequest(`Student with ID ${student.id} is already linked to another parent`);
+                    throw new BadRequest(`${`${student.firstname || ""} ${student.lastname || ""}`.trim() || "A student"} is already linked to another parent`);
                 }
             }
         }
@@ -167,7 +183,10 @@ export const updateParent = async (req: Request, res: Response) => {
     if (phoneNumber) updateData.phoneNumber = phoneNumber;
     if (status) updateData.status = status;
 
-    if (newPassword && oldPassword) {
+    // Admin sets a new password directly (Edit Parent form); the old/new pair stays for other callers.
+    if (req.body.password && String(req.body.password).trim()) {
+        updateData.password = await bcrypt.hash(String(req.body.password).trim(), 10);
+    } else if (newPassword && oldPassword) {
         const isPasswordValid = await bcrypt.compare(oldPassword, existingParent[0].password);
         if (!isPasswordValid) {
             throw new BadRequest("old password is not correct");

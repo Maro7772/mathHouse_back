@@ -10,7 +10,7 @@ import {
 import { Student } from "../../models/schema/admin/Student";
 import { teachers } from "../../models/schema/admin/teacher";
 import { parents } from "../../models/schema/admin/parent";
-import { eq, like, or, desc, sql } from "drizzle-orm";
+import { eq, like, or, desc, sql, inArray } from "drizzle-orm";
 import { SuccessResponse } from "../../utils/response";
 import { BadRequest } from "../../Errors/BadRequest";
 import { NotFound } from "../../Errors";
@@ -276,11 +276,44 @@ export const getAllNotifications = async (req: Request, res: Response) => {
         .limit(Number(limit))
         .offset(offset);
 
+    // Who each notification went to: per audience the number of recipients, how many read it, and the first names.
+    // ("Everyone" is stored as one row per person too, so the counts are the real reach.)
+    const ids = notificationsList.map(n => n.id);
+    type Agg = { nid: string; total: number; read: number; names: string | null };
+    const pack = (rows: Agg[]) => new Map(rows.map(r => [r.nid, { count: Number(r.total) || 0, read: Number(r.read) || 0, names: r.names ? String(r.names).split("||").filter(Boolean) : [] }]));
+    const FIRST = 3;
+    const [stuRows, parRows, teaRows] = ids.length ? await Promise.all([
+        db.select({
+            nid: notificationStudents.notificationId,
+            total: sql<number>`COUNT(*)`,
+            read: sql<number>`COALESCE(SUM(${notificationStudents.isRead}), 0)`,
+            names: sql<string>`SUBSTRING_INDEX(GROUP_CONCAT(TRIM(CONCAT(COALESCE(${Student.firstname}, ''), ' ', COALESCE(${Student.lastname}, ''))) ORDER BY ${Student.firstname} SEPARATOR '||'), '||', ${FIRST})`,
+        }).from(notificationStudents).leftJoin(Student, eq(Student.id, notificationStudents.studentId))
+            .where(inArray(notificationStudents.notificationId, ids)).groupBy(notificationStudents.notificationId),
+        db.select({
+            nid: notificationParents.notificationId,
+            total: sql<number>`COUNT(*)`,
+            read: sql<number>`COALESCE(SUM(${notificationParents.isRead}), 0)`,
+            names: sql<string>`SUBSTRING_INDEX(GROUP_CONCAT(${parents.name} ORDER BY ${parents.name} SEPARATOR '||'), '||', ${FIRST})`,
+        }).from(notificationParents).leftJoin(parents, eq(parents.id, notificationParents.parentId))
+            .where(inArray(notificationParents.notificationId, ids)).groupBy(notificationParents.notificationId),
+        db.select({
+            nid: notificationTeachers.notificationId,
+            total: sql<number>`COUNT(*)`,
+            read: sql<number>`COALESCE(SUM(${notificationTeachers.isRead}), 0)`,
+            names: sql<string>`SUBSTRING_INDEX(GROUP_CONCAT(${teachers.name} ORDER BY ${teachers.name} SEPARATOR '||'), '||', ${FIRST})`,
+        }).from(notificationTeachers).leftJoin(teachers, eq(teachers.id, notificationTeachers.teacherId))
+            .where(inArray(notificationTeachers.notificationId, ids)).groupBy(notificationTeachers.notificationId),
+    ]) : [[], [], []];
+    const stu = pack(stuRows as Agg[]), par = pack(parRows as Agg[]), tea = pack(teaRows as Agg[]);
+    const none = { count: 0, read: 0, names: [] as string[] };
+
     // Format time
     const formattedNotifications = notificationsList.map(n => ({
         ...n,
         time: n.dateTime ? new Date(n.dateTime).toLocaleTimeString('en-US', { hour12: false }) : '00:00:00',
-        text: n.notification.substring(0, 50) + (n.notification.length > 50 ? '...' : '')
+        text: n.notification.substring(0, 50) + (n.notification.length > 50 ? '...' : ''),
+        recipients: { students: stu.get(n.id) || none, parents: par.get(n.id) || none, teachers: tea.get(n.id) || none },
     }));
 
     SuccessResponse(res, formattedNotifications);

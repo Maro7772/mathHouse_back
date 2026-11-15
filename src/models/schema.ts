@@ -44,6 +44,9 @@ export * from "./schema/admin/SessionRatingQuestions";
 export * from "./schema/admin/ExtraHomework";
 export * from "./schema/admin/StudentAvailabilityPlan";
 export * from "./schema/admin/Notes";
+export * from "./schema/admin/teacherPortal";
+export * from "./schema/admin/studentPortal";
+export * from "./schema/admin/finance";
 
 // Drive schema
 export * from "../drive/models/drive";

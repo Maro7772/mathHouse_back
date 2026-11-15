@@ -41,6 +41,19 @@ export const sessions = mysqlTable("sessions", {
     // Explanation PDF uploaded by teacher after the session (visible to enrolled students)
     teacher_explanation_pdf: varchar("teacher_explanation_pdf", { length: 500 }),
 
+    // ── Cancellation ────────────────────────────────────────────────────────────
+    // Set by admin directly, or when admin accepts a teacher's cancellation request.
+    status: mysqlEnum("status", ["scheduled", "cancelled"]).notNull().default("scheduled"),
+    cancelReason: text("cancel_reason"),
+    cancelledBy: mysqlEnum("cancelled_by", ["admin", "teacher"]),
+    cancelledAt: timestamp("cancelled_at"),
+
+    // ── Planner dispatch ────────────────────────────────────────────────────────
+    // Set when the admin dispatches (confirms) the session from Live → Planner → Timetable;
+    // students and the teacher are notified at that moment.
+    confirmedAt: timestamp("confirmed_at"),
+    confirmedBy: char("confirmed_by", { length: 36 }),
+
     createdAt: timestamp("created_at").defaultNow(),
     updatedAt: timestamp("updated_at").defaultNow().onUpdateNow(),
 });

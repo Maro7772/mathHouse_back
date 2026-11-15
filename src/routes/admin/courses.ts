@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { getCatalogOverview } from "../../controllers/admin/store";
 import {
     createCourse,
     getAllCourses,
@@ -22,6 +23,7 @@ router.get("/categories", requirePermission("courses", "View"), catchAsync(getCa
 router.get("/selection",  requirePermission("courses", "View"), catchAsync(selectionCourses));
 
 // ── List & detail ─────────────────────────────────────────────────────────
+router.get("/catalog", requirePermission("courses", "View"), catchAsync(getCatalogOverview));
 router.get("/",                         requirePermission("courses", "View"),   catchAsync(getAllCourses));
 router.get("/category/:categoryId",     requirePermission("courses", "View"),   catchAsync(getCoursesbyCategoryId));
 router.get("/:id",                      requirePermission("courses", "View"),   catchAsync(getCourseById));
@@ -38,4 +40,4 @@ router.put("/:id",                      requirePermission("courses", "Edit"),   
 router.delete("/:id",                   requirePermission("courses", "Delete"), catchAsync(deleteCourse));
 router.delete("/:id/teachers/:teacherId", requirePermission("courses", "Edit"),catchAsync(removeTeacherFromCourse));
 
-export default router;
+export default router;

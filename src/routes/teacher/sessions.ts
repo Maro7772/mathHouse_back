@@ -14,6 +14,9 @@ import {
     getTeacherSessionRatingForm,
     // submitTeacherSessionRatings,
 } from "../../controllers/teacher/SessionRating";
+import { updateMeetingLink, saveAttendance } from "../../controllers/teacher/portal";
+import { validate } from "../../middlewares/validation";
+import { meetingLinkSchema, attendanceSchema } from "../../validation/teacher/portal";
 import { catchAsync } from "../../utils/catchAsync";
 
 const router = Router();
@@ -41,6 +44,12 @@ router.post("/:id/explanation-pdf", catchAsync(uploadTeacherExplanationPdf));
 
 // DELETE /api/teacher/sessions/:id/explanation-pdf     — delete teacher explanation PDF
 router.delete("/:id/explanation-pdf", catchAsync(deleteTeacherExplanationPdf));
+
+// PATCH /api/teacher/sessions/:id/meeting-link        — publish / clear the meeting link for students
+router.patch("/:id/meeting-link", validate(meetingLinkSchema), catchAsync(updateMeetingLink));
+
+// PUT /api/teacher/sessions/:id/attendance             — mark students present / absent
+router.put("/:id/attendance", validate(attendanceSchema), catchAsync(saveAttendance));
 
 // ── Session Ratings ───────────────────────────────────────────────
 // GET /api/teacher/sessions/:id/ratings                — get all student ratings for a session

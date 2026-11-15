@@ -1,4 +1,5 @@
 import { Router } from "express";
+import notificationsRouter from "./portal";
 import studentauthRoutr from "./studentauth";
 import profileRouter from "./profile";
 import walletRouter from "./wallet";
@@ -47,5 +48,6 @@ router.use("/ideas", ideasRouter)
 router.use("/reports", reportsRouter)
 router.use("/promo-codes", promoCodesRouter)
 router.use("/notes", notesRouter)
+router.use("/notifications", notificationsRouter)
 export default router
 

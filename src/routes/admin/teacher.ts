@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { getTeachersOverview } from "../../controllers/admin/teacherRequests";
 import {
     createTeacher,
     getTeacherById,
@@ -14,6 +15,7 @@ import { requirePermission } from "../../middlewares/requirePermission";
 const router = Router();
 router.get("/selectionCourses", requirePermission("teachers", "View"), catchAsync(getAllCourses));
 router.get("/selectionCategories", requirePermission("teachers", "View"), catchAsync(getCategorySelection));
+router.get("/overview", requirePermission("teachers", "View"), catchAsync(getTeachersOverview));
 router.get("/selectionTeachers", requirePermission("teachers", "View"), catchAsync(getAllTeachers));
 
 router.post("/", requirePermission("teachers", "Add"), catchAsync(createTeacher));

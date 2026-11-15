@@ -7,6 +7,7 @@ import { BadRequest } from "../../Errors/BadRequest";
 import { UnauthorizedError } from "../../Errors";
 import { Student } from "../../models/schema/admin/Student";
 import { grade } from "../../models/schema/admin/grade";
+import { ancestorsOf } from "../../utils/categoryTree";
 
 export const getAllCategory = async (req: Request, res: Response) => {
     const studentId = req.user?.id;
@@ -36,13 +37,10 @@ export const getAllCategory = async (req: Request, res: Response) => {
         }
     });
 
+    // Loop-safe: a category parent loop (A → B → A) in the data must never hang the server.
     const isDescendant = (catId: string, targetAncestorId: string): boolean => {
-        let current = categoryMap.get(catId);
-        while (current?.parentCategoryId) {
-            if (current.parentCategoryId === targetAncestorId) return true;
-            current = categoryMap.get(current.parentCategoryId);
-        }
-        return false;
+        const start = categoryMap.get(catId);
+        return !!start && ancestorsOf(start, categoryMap).some((p) => p.id === targetAncestorId);
     };
 
     const allowedSubcategoryIds = studentGradeInfo ? [studentGradeInfo.categoryId] : [];
@@ -60,19 +58,7 @@ export const getAllCategory = async (req: Request, res: Response) => {
     });
 
     const data = filteredCategories.map(cat => {
-        const ancestors: { id: string, name: string, level: number }[] = [];
-        let current = cat;
-        let level = 1;
-
-        while (current.parentCategoryId) {
-            const parent = categoryMap.get(current.parentCategoryId);
-            if (parent) {
-                ancestors.push({ id: parent.id, name: parent.name, level: level++ });
-                current = parent;
-            } else {
-                break;
-            }
-        }
+        const ancestors = ancestorsOf(cat, categoryMap).map((p, i) => ({ id: p.id, name: p.name, level: i + 1 }));
 
         const isLeaf = !parentIds.has(cat.id);
 
@@ -102,19 +88,7 @@ export const getCategoryById = async (req: Request, res: Response) => {
     const categoryMap = new Map<string, typeof categories[0]>();
     categories.forEach((cat) => categoryMap.set(cat.id, cat));
 
-    const ancestors: { id: string; name: string; level: number }[] = [];
-    let current = existingCategory;
-    let level = 1;
-
-    while (current.parentCategoryId) {
-        const parent = categoryMap.get(current.parentCategoryId);
-        if (parent) {
-            ancestors.push({ id: parent.id, name: parent.name, level: level++ });
-            current = parent;
-        } else {
-            break;
-        }
-    }
+    const ancestors = ancestorsOf(existingCategory, categoryMap).map((p, i) => ({ id: p.id, name: p.name, level: i + 1 }));
 
     const data = {
         ...existingCategory,

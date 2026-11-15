@@ -204,7 +204,8 @@ export const getDiagnosticExams = async (req: Request, res: Response) => {
     const categoryIds: string[] = [];
     let currentId: string | null = student.categoryId;
     while (currentId) {
-        if (!categoryIds.includes(currentId)) categoryIds.push(currentId);
+        if (categoryIds.includes(currentId)) break; // category parent loop (A → B → A) — stop instead of looping forever
+        categoryIds.push(currentId);
         const [cat]: any = await db
             .select({ parentCategoryId: category.parentCategoryId })
             .from(category)

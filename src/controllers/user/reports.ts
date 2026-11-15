@@ -32,7 +32,8 @@ const getStudentId = (req: Request): string => {
 
 export const getStudentQuizReports = async (req: Request, res: Response) => {
     const studentId = getStudentId(req);
-    const { courseId } = req.params;
+    // the app sends ?courseId=… (the route has no :courseId param)
+    const courseId = (req.query.courseId as string) || req.params.courseId;
 
     const existingStudent = await db.select().from(Student).where(eq(Student.id, studentId));
     if (existingStudent.length === 0) {
@@ -301,9 +302,8 @@ const getCategoryHierarchy = async (studentCategory: string | null): Promise<str
     const categoryIds: string[] = [];
     let currentId: string | null = studentCategory;
     while (currentId) {
-        if (!categoryIds.includes(currentId)) {
-            categoryIds.push(currentId);
-        }
+        if (categoryIds.includes(currentId)) break; // category parent loop (A → B → A) — stop instead of looping forever
+        categoryIds.push(currentId);
         const [cat]: any = await db
             .select({ parentCategoryId: category.parentCategoryId })
             .from(category)

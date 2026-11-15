@@ -2,7 +2,7 @@ import { Request, Response } from "express";
 import { randomUUID } from "crypto";
 import { db } from "../../models/connection";
 import { sessions, sessionLessons, sessionUsers, sessionGroups, sessionAttendance, sessionStudentPdfs } from "../../models/schema/admin/Session";
-import { lessons, lessonIdeas, chapters, courses, teachers, sessionRatingQuestions, sessionStudentRatings, sessionStudentQuestionRatings } from "../../models/schema";
+import { lessons, lessonIdeas, chapters, courses, category, teachers, sessionRatingQuestions, sessionStudentRatings, sessionStudentQuestionRatings } from "../../models/schema";
 import { groups, groupStudents } from "../../models/schema/admin/Groups";
 import { Student } from "../../models/schema/admin/Student";
 import { eq, and, or, inArray, sql, desc, asc } from "drizzle-orm";
@@ -63,11 +63,16 @@ async function fetchSessionResources(sessionIds: string[]) {
                 id: courses.id,
                 name: courses.name,
             },
+            category: {
+                id: category.id,
+                name: category.name,
+            },
         })
         .from(sessionLessons)
         .innerJoin(lessons, eq(sessionLessons.lessonId, lessons.id))
         .leftJoin(chapters, eq(lessons.chapterId, chapters.id))
         .leftJoin(courses, eq(lessons.courseId, courses.id))
+        .leftJoin(category, eq(courses.categoryId, category.id))
         .where(inArray(sessionLessons.sessionId, sessionIds));
 
     // Unique lesson IDs to fetch ideas
@@ -105,6 +110,7 @@ async function fetchSessionResources(sessionIds: string[]) {
                 ...row.lesson,
                 chapter: row.chapter,
                 course: row.course,
+                category: row.category,
                 ideas: ideasByLesson.get(row.lesson.id) || [],
             });
         }
@@ -204,6 +210,58 @@ async function fetchSessionRatings(sessionIds: string[]) {
     return ratingsBySession;
 }
 
+/**
+ * Lightweight student list (direct + via groups) with attendance status, grouped by sessionId.
+ */
+async function fetchSessionStudentsLite(sessionIds: string[]) {
+    const bySession = new Map<string, { id: string; name: string; avatar: string | null; attendance: string }[]>();
+    if (sessionIds.length === 0) return bySession;
+
+    const [directRows, groupRows, attendanceRows] = await Promise.all([
+        db.select({ sessionId: sessionUsers.sessionId, studentId: sessionUsers.studentId })
+            .from(sessionUsers)
+            .where(inArray(sessionUsers.sessionId, sessionIds)),
+        db.select({ sessionId: sessionGroups.sessionId, studentId: groupStudents.studentId })
+            .from(sessionGroups)
+            .innerJoin(groupStudents, eq(sessionGroups.groupId, groupStudents.groupId))
+            .where(inArray(sessionGroups.sessionId, sessionIds)),
+        db.select({ sessionId: sessionAttendance.sessionId, studentId: sessionAttendance.studentId, status: sessionAttendance.status })
+            .from(sessionAttendance)
+            .where(inArray(sessionAttendance.sessionId, sessionIds)),
+    ]);
+
+    const idsBySession = new Map<string, Set<string>>();
+    [...directRows, ...groupRows].forEach(r => {
+        if (!idsBySession.has(r.sessionId)) idsBySession.set(r.sessionId, new Set());
+        idsBySession.get(r.sessionId)!.add(r.studentId);
+    });
+    const allStudentIds = Array.from(new Set([...directRows, ...groupRows].map(r => r.studentId)));
+    if (allStudentIds.length === 0) return bySession;
+
+    const studentRows = await db
+        .select({ id: Student.id, firstname: Student.firstname, lastname: Student.lastname, avatar: Student.avatar })
+        .from(Student)
+        .where(inArray(Student.id, allStudentIds));
+    const studentMap = new Map(studentRows.map(st => [st.id, st]));
+    const attendanceMap = new Map(attendanceRows.map(a => [`${a.sessionId}:${a.studentId}`, a.status]));
+
+    idsBySession.forEach((ids, sessionId) => {
+        const list: { id: string; name: string; avatar: string | null; attendance: string }[] = [];
+        ids.forEach(studentId => {
+            const st = studentMap.get(studentId);
+            if (!st) return;
+            list.push({
+                id: st.id,
+                name: `${st.firstname} ${st.lastname}`.trim(),
+                avatar: st.avatar,
+                attendance: attendanceMap.get(`${sessionId}:${studentId}`) ?? "not_marked",
+            });
+        });
+        bySession.set(sessionId, list);
+    });
+    return bySession;
+}
+
 // ── Controllers ───────────────────────────────────────────────────────────────
 
 export const getAllTeacherSessions = async (req: Request, res: Response) => {
@@ -229,6 +287,10 @@ export const getAllTeacherSessions = async (req: Request, res: Response) => {
             session_pdf: sessions.session_pdf,
             session_answers_pdf: sessions.session_answers_pdf,
             teacher_explanation_pdf: sessions.teacher_explanation_pdf,
+            status: sessions.status,
+            cancelReason: sessions.cancelReason,
+            cancelledBy: sessions.cancelledBy,
+            cancelledAt: sessions.cancelledAt,
             createdAt: sessions.createdAt,
         })
         .from(sessions)
@@ -236,10 +298,11 @@ export const getAllTeacherSessions = async (req: Request, res: Response) => {
         .orderBy(desc(sessions.sessionDate), desc(sessions.timeFrom));
 
     const sessionIds = rawSessions.map(s => s.id);
-    const [resourcesBySession, ratingsBySession, materialsBySession] = await Promise.all([
+    const [resourcesBySession, ratingsBySession, materialsBySession, studentsBySession] = await Promise.all([
         fetchSessionResources(sessionIds),
         fetchSessionRatings(sessionIds),
         resolveSessionMaterials(sessionIds),
+        fetchSessionStudentsLite(sessionIds),
     ]);
 
     const result = rawSessions.map(s => {
@@ -247,6 +310,7 @@ export const getAllTeacherSessions = async (req: Request, res: Response) => {
         const overallSum = ratings.reduce((sum, r) => sum + (Number(r.overallRating) || 0), 0);
         const averageRating = ratings.length > 0 ? Number((overallSum / ratings.length).toFixed(2)) : null;
         const mat = materialsBySession.get(s.id) || emptySessionMaterials();
+        const students = studentsBySession.get(s.id) || [];
 
         return {
             ...s,
@@ -254,6 +318,8 @@ export const getAllTeacherSessions = async (req: Request, res: Response) => {
             session_answers_pdf: mat.session_answers_pdf,
             materials: mat.materials,
             lessons: resourcesBySession.get(s.id) || [],
+            students,
+            studentsCount: students.length,
             averageRating,
             totalRatedStudents: ratings.length,
             ratings,
@@ -293,6 +359,10 @@ export const getUpcomingTeacherSessions = async (req: Request, res: Response) =>
             session_pdf: sessions.session_pdf,
             session_answers_pdf: sessions.session_answers_pdf,
             teacher_explanation_pdf: sessions.teacher_explanation_pdf,
+            status: sessions.status,
+            cancelReason: sessions.cancelReason,
+            cancelledBy: sessions.cancelledBy,
+            cancelledAt: sessions.cancelledAt,
         })
         .from(sessions)
         .where(
@@ -364,6 +434,10 @@ export const getPastTeacherSessions = async (req: Request, res: Response) => {
             session_pdf: sessions.session_pdf,
             session_answers_pdf: sessions.session_answers_pdf,
             teacher_explanation_pdf: sessions.teacher_explanation_pdf,
+            status: sessions.status,
+            cancelReason: sessions.cancelReason,
+            cancelledBy: sessions.cancelledBy,
+            cancelledAt: sessions.cancelledAt,
         })
         .from(sessions)
         .where(
@@ -431,6 +505,10 @@ export const getTeacherSessionById = async (req: Request, res: Response) => {
             session_pdf: sessions.session_pdf,
             session_answers_pdf: sessions.session_answers_pdf,
             teacher_explanation_pdf: sessions.teacher_explanation_pdf,
+            status: sessions.status,
+            cancelReason: sessions.cancelReason,
+            cancelledBy: sessions.cancelledBy,
+            cancelledAt: sessions.cancelledAt,
             createdAt: sessions.createdAt,
         })
         .from(sessions)

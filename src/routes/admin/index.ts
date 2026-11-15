@@ -36,6 +36,11 @@ import extraHomeworkRouter from "./ExtraHomework"
 import availabilityPlanRouter from "./availabilityPlan"
 import notesRouter from "./notes"
 import availabilitySlotRouter from "./availabilitySlot"
+import teacherRequestsRouter from "./teacherRequests"
+import plannerRouter from "./planner"
+import financeRouter from "./finance"
+import storeRouter from "./store"
+import studentCancelRequestsRouter from "./studentCancelRequests"
 import { authenticated } from "../../middlewares/authenticated";
 import { authorizeRoles } from "../../middlewares/authorized";
 import authRouter from "./auth"
@@ -63,6 +68,11 @@ router.use("/parent", parentRouter)
 router.use("/admin", adminRouter)
 router.use("/notification", notificationRouter)
 router.use("/teacher", teacherRouter)
+router.use("/teacher-requests", teacherRequestsRouter)
+router.use("/planner", plannerRouter)
+router.use("/finance", financeRouter)
+router.use("/store", storeRouter)
+router.use("/student-cancel-requests", studentCancelRequestsRouter)
 router.use("/courses", courseRouter)
 router.use("/quiz", quizRouter)
 router.use("/popup", popupRouter)
