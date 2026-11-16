@@ -12,6 +12,7 @@ import { BadRequest } from "../../Errors/BadRequest";
 import { validateAndSavePdf, deleteImage } from "../../utils/handleImages";
 import { generateSecureStreamUrl } from "../../drive/services/services";
 import { resolveSessionMaterials, emptySessionMaterials } from "../../utils/sessionMaterials";
+import { getChargeStatuses } from "../../utils/sessionAttendance";
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -214,7 +215,7 @@ async function fetchSessionRatings(sessionIds: string[]) {
  * Lightweight student list (direct + via groups) with attendance status, grouped by sessionId.
  */
 async function fetchSessionStudentsLite(sessionIds: string[]) {
-    const bySession = new Map<string, { id: string; name: string; avatar: string | null; attendance: string }[]>();
+    const bySession = new Map<string, { id: string; name: string; avatar: string | null; attendance: string; chargeStatus: string | null }[]>();
     if (sessionIds.length === 0) return bySession;
 
     const [directRows, groupRows, attendanceRows] = await Promise.all([
@@ -244,9 +245,11 @@ async function fetchSessionStudentsLite(sessionIds: string[]) {
         .where(inArray(Student.id, allStudentIds));
     const studentMap = new Map(studentRows.map(st => [st.id, st]));
     const attendanceMap = new Map(attendanceRows.map(a => [`${a.sessionId}:${a.studentId}`, a.status]));
+    // "paid" | "free" | "unpaid" (present at 0 balance) | null (not charged yet)
+    const chargeMap = await getChargeStatuses(sessionIds);
 
     idsBySession.forEach((ids, sessionId) => {
-        const list: { id: string; name: string; avatar: string | null; attendance: string }[] = [];
+        const list: { id: string; name: string; avatar: string | null; attendance: string; chargeStatus: string | null }[] = [];
         ids.forEach(studentId => {
             const st = studentMap.get(studentId);
             if (!st) return;
@@ -255,6 +258,7 @@ async function fetchSessionStudentsLite(sessionIds: string[]) {
                 name: `${st.firstname} ${st.lastname}`.trim(),
                 avatar: st.avatar,
                 attendance: attendanceMap.get(`${sessionId}:${studentId}`) ?? "not_marked",
+                chargeStatus: chargeMap.get(`${sessionId}:${studentId}`) ?? null,
             });
         });
         bySession.set(sessionId, list);

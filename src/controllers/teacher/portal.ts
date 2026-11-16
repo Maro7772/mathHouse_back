@@ -79,13 +79,14 @@ export const saveAttendance = async (req: Request, res: Response) => {
     if (unknown.length > 0) throw new BadRequest("Some students are not assigned to this session");
 
     const lessonIds = (await getLessonIdsBySession([session.id])).get(session.id) || [];
-    const results: { studentId: string; status: string; balanceDeducted?: boolean }[] = [];
+    const results: { studentId: string; status: string; balanceDeducted?: boolean; chargeStatus?: string }[] = [];
 
     await db.transaction(async (tx) => {
         for (const entry of entries) {
             if (entry.status === "present") {
-                const { balanceDeducted } = await markStudentPresent(tx, entry.studentId, session, lessonIds);
-                results.push({ studentId: entry.studentId, status: "present", balanceDeducted });
+                // a student with 0 balance is still marked present, recorded as "unpaid"
+                const { balanceDeducted, chargeStatus } = await markStudentPresent(tx, entry.studentId, session, lessonIds);
+                results.push({ studentId: entry.studentId, status: "present", balanceDeducted, chargeStatus });
                 continue;
             }
             // absent: record it (a deduction already made for this session is not refunded here)
@@ -105,7 +106,8 @@ export const saveAttendance = async (req: Request, res: Response) => {
         }
     });
 
-    return SuccessResponse(res, { message: "Attendance saved", results });
+    const unpaidCount = results.filter(r => r.chargeStatus === "unpaid").length;
+    return SuccessResponse(res, { message: "Attendance saved", results, unpaidCount });
 };
 
 // ── Requests (cover / cancellation) ──────────────────────────────────────────

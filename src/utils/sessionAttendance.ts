@@ -1,11 +1,13 @@
 // utils/sessionAttendance.ts
-// Shared "mark a student present" logic, used by admin manual attendance and by the teacher portal.
+// Shared attendance logic, used by the student Join button, the teacher portal and admin manual attendance,
+// so all three charge and unlock content the same way.
 import { randomUUID } from "crypto";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { db } from "../models/connection";
 import { sessionAttendance, sessionLessons, sessionPackageDeductions, sessionUsers } from "../models/schema/admin/Session";
 import { Student } from "../models/schema/admin/Student";
 import { enrolledItems } from "../models/schema/user/enrolledItems";
+import { BadRequest } from "../Errors";
 
 type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
 
@@ -14,6 +16,9 @@ export type AttendanceSession = {
     sessionRelationalType: string | null;
     contentAccessDays: number | null;
 };
+
+/** What happened to the student's balance for one session. */
+export type ChargeStatus = "paid" | "free" | "unpaid";
 
 /** Lesson ids attached to each session, grouped by session id. */
 export async function getLessonIdsBySession(sessionIds: string[], runner: Tx | typeof db = db) {
@@ -30,12 +35,78 @@ export async function getLessonIdsBySession(sessionIds: string[], runner: Tx | t
     return map;
 }
 
+/** Re-Explanation is free when the student already attended every one of its lessons in other sessions. */
+export async function isFreeReExplanation(
+    runner: Tx | typeof db,
+    studentId: string,
+    session: { id: string; sessionRelationalType: string | null },
+    sessionLessonIds: string[],
+) {
+    if (session.sessionRelationalType !== "Re-Explanation" || sessionLessonIds.length === 0) return false;
+    const rows = await runner
+        .select({ lessonId: sessionLessons.lessonId })
+        .from(sessionAttendance)
+        .innerJoin(sessionLessons, eq(sessionAttendance.sessionId, sessionLessons.sessionId))
+        .where(and(
+            eq(sessionAttendance.studentId, studentId),
+            eq(sessionAttendance.status, "present"),
+            sql`${sessionAttendance.sessionId} != ${session.id}`,
+            inArray(sessionLessons.lessonId, sessionLessonIds)
+        ));
+    const attended = new Set(rows.map(r => r.lessonId));
+    return sessionLessonIds.every(id => attended.has(id));
+}
+
+/**
+ * Charges a student for one session, at most once (a session_package_deductions row is the proof).
+ *  - already charged (by the 24h job, Join, teacher or admin) → nothing happens
+ *  - free Re-Explanation → recorded as "free"
+ *  - balance > 0 → 1 is taken, recorded as "paid"
+ *  - balance 0 → `allowUnpaid` (teacher/admin) records "unpaid"; otherwise (student Join) it is refused
+ */
+export async function chargeForSession(
+    tx: Tx,
+    studentId: string,
+    session: AttendanceSession,
+    sessionLessonIds: string[],
+    { allowUnpaid }: { allowUnpaid: boolean },
+): Promise<{ status: ChargeStatus; newCharge: boolean }> {
+    const [existing] = await tx
+        .select({ chargeStatus: sessionPackageDeductions.chargeStatus })
+        .from(sessionPackageDeductions)
+        .where(and(eq(sessionPackageDeductions.sessionId, session.id), eq(sessionPackageDeductions.studentId, studentId)))
+        .limit(1);
+    if (existing) return { status: existing.chargeStatus as ChargeStatus, newCharge: false };
+
+    let status: ChargeStatus;
+    if (await isFreeReExplanation(tx, studentId, session, sessionLessonIds)) {
+        status = "free";
+    } else {
+        // atomic: never goes below 0, and no race between checking and taking
+        const [result] = await tx
+            .update(Student)
+            .set({ livebalance: sql`${Student.livebalance} - 1` })
+            .where(and(eq(Student.id, studentId), sql`${Student.livebalance} > 0`));
+        if (((result as any)?.affectedRows ?? 0) > 0) status = "paid";
+        else if (allowUnpaid) status = "unpaid";
+        else throw new BadRequest("Insufficient live balance");
+    }
+
+    await tx.insert(sessionPackageDeductions).values({
+        id: randomUUID(),
+        sessionId: session.id,
+        studentId,
+        deductedAt: new Date(),
+        chargeStatus: status,
+    });
+    return { status, newCharge: true };
+}
+
 /**
  * Marks one student present in one session, inside a transaction:
  *  1. makes sure the student is enrolled in session_users
- *  2. upserts session_attendance = "present"
- *  3. deducts 1 live session from the student's balance, once per session
- *     (Re-Explanation is free when the student already attended all its lessons elsewhere)
+ *  2. charges the session once (see chargeForSession)
+ *  3. upserts session_attendance = "present"
  *  4. unlocks the session's lessons in enrolled_items (expiring after contentAccessDays, if set)
  */
 export async function markStudentPresent(
@@ -43,7 +114,8 @@ export async function markStudentPresent(
     studentId: string,
     session: AttendanceSession,
     sessionLessonIds: string[],
-): Promise<{ balanceDeducted: boolean; lessonsUnlocked: number }> {
+    { allowUnpaid = true }: { allowUnpaid?: boolean } = {},
+): Promise<{ balanceDeducted: boolean; chargeStatus: ChargeStatus; lessonsUnlocked: number }> {
     // 1. Enrollment
     const [existingSessionUser] = await tx
         .select({ id: sessionUsers.id })
@@ -54,7 +126,10 @@ export async function markStudentPresent(
         await tx.insert(sessionUsers).values({ id: randomUUID(), sessionId: session.id, studentId });
     }
 
-    // 2. Attendance
+    // 2. Charge (before attendance, so the Re-Explanation check doesn't see this session as attended)
+    const charge = await chargeForSession(tx, studentId, session, sessionLessonIds, { allowUnpaid });
+
+    // 3. Attendance
     const [existingAttendance] = await tx
         .select({ id: sessionAttendance.id })
         .from(sessionAttendance)
@@ -73,47 +148,6 @@ export async function markStudentPresent(
             status: "present",
             attendedAt,
         });
-    }
-
-    // 3. Balance deduction (never twice for the same session)
-    const [existingDeduction] = await tx
-        .select({ id: sessionPackageDeductions.id })
-        .from(sessionPackageDeductions)
-        .where(and(eq(sessionPackageDeductions.sessionId, session.id), eq(sessionPackageDeductions.studentId, studentId)))
-        .limit(1);
-
-    let balanceDeducted = false;
-    if (!existingDeduction) {
-        let shouldDeduct = true;
-
-        if (session.sessionRelationalType === "Re-Explanation" && sessionLessonIds.length > 0) {
-            const previouslyAttendedRows = await tx
-                .select({ lessonId: sessionLessons.lessonId })
-                .from(sessionAttendance)
-                .innerJoin(sessionLessons, eq(sessionAttendance.sessionId, sessionLessons.sessionId))
-                .where(and(
-                    eq(sessionAttendance.studentId, studentId),
-                    eq(sessionAttendance.status, "present"),
-                    sql`${sessionAttendance.sessionId} != ${session.id}`,
-                    inArray(sessionLessons.lessonId, sessionLessonIds)
-                ));
-            const attendedLessonIdSet = new Set(previouslyAttendedRows.map(r => r.lessonId));
-            if (sessionLessonIds.every(id => attendedLessonIdSet.has(id))) shouldDeduct = false;
-        }
-
-        if (shouldDeduct) {
-            await tx
-                .update(Student)
-                .set({ livebalance: sql`GREATEST(0, ${Student.livebalance} - 1)` })
-                .where(eq(Student.id, studentId));
-            await tx.insert(sessionPackageDeductions).values({
-                id: randomUUID(),
-                sessionId: session.id,
-                studentId,
-                deductedAt: new Date(),
-            }).catch(() => {});
-            balanceDeducted = true;
-        }
     }
 
     // 4. Unlock lessons
@@ -140,5 +174,25 @@ export async function markStudentPresent(
         }
     }
 
-    return { balanceDeducted, lessonsUnlocked };
+    return {
+        balanceDeducted: charge.newCharge && charge.status === "paid",
+        chargeStatus: charge.status,
+        lessonsUnlocked,
+    };
+}
+
+/** "studentId" → charge status, for the given sessions (only students that have a charge record). */
+export async function getChargeStatuses(sessionIds: string[]) {
+    const map = new Map<string, ChargeStatus>();
+    if (sessionIds.length === 0) return map;
+    const rows = await db
+        .select({
+            sessionId: sessionPackageDeductions.sessionId,
+            studentId: sessionPackageDeductions.studentId,
+            chargeStatus: sessionPackageDeductions.chargeStatus,
+        })
+        .from(sessionPackageDeductions)
+        .where(inArray(sessionPackageDeductions.sessionId, sessionIds));
+    for (const r of rows) map.set(`${r.sessionId}:${r.studentId}`, r.chargeStatus as ChargeStatus);
+    return map;
 }

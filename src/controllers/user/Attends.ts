@@ -14,6 +14,7 @@ import { BadRequest, NotFound, UnauthorizedError } from "../../Errors";
 import { generateSecureStreamUrl } from "../../drive/services/services";
 import { resolveSessionMaterials, emptySessionMaterials, SessionMaterialsResult } from "../../utils/sessionMaterials";
 import { processUpcomingSessionsDeductions } from "../../jobs/cronServices/sessionPackageCron";
+import { getLessonIdsBySession, markStudentPresent } from "../../utils/sessionAttendance";
 
 // ── config ────────────────────────────────────────────────────────────────────
 
@@ -616,6 +617,7 @@ export const joinSession = async (req: Request, res: Response) => {
             timeTo: sessions.timeTo,
             sessionLink: sessions.session_link,
             sessionRelationalType: sessions.sessionRelationalType,
+            contentAccessDays: sessions.contentAccessDays,
             status: sessions.status,
         })
         .from(sessions)
@@ -663,91 +665,12 @@ export const joinSession = async (req: Request, res: Response) => {
             throw new BadRequest("The session has already ended");
         }
 
-        // ── Re-Explanation balance logic ──────────────────────────────────────
-        // Deduct balance unless the student already attended ALL of this
-        // session's lessons in previous sessions.
-        const sessionLessonRows = await tx
-            .select({ lessonId: sessionLessons.lessonId })
-            .from(sessionLessons)
-            .where(eq(sessionLessons.sessionId, sessionId));
-
-        const lessonIdsInSession = sessionLessonRows.map(r => r.lessonId);
-
-        let shouldDeductBalance = true;
-
-        if (session.sessionRelationalType === "Re-Explanation" && lessonIdsInSession.length > 0) {
-            const previouslyAttendedRows = await tx
-                .select({ lessonId: sessionLessons.lessonId })
-                .from(sessionAttendance)
-                .innerJoin(sessionLessons, eq(sessionAttendance.sessionId, sessionLessons.sessionId))
-                .where(and(
-                    eq(sessionAttendance.studentId, studentId),
-                    eq(sessionAttendance.status, "present"),
-                    sql`${sessionAttendance.sessionId} != ${sessionId}`,
-                    inArray(sessionLessons.lessonId, lessonIdsInSession)
-                ));
-
-            const attendedLessonIdSet = new Set(previouslyAttendedRows.map(r => r.lessonId));
-            if (lessonIdsInSession.every(id => attendedLessonIdSet.has(id))) {
-                shouldDeductBalance = false;
-            }
-        }
-
-        // ── Atomic balance deduction (no check-then-update race) ──────────────
-        if (shouldDeductBalance) {
-            const [result] = await tx
-                .update(Student)
-                .set({ livebalance: sql`${Student.livebalance} - 1` })
-                .where(and(eq(Student.id, studentId), gt(Student.livebalance, 0)));
-
-            if (!result || (result as any).affectedRows === 0) {
-                throw new BadRequest("Insufficient live balance");
-            }
-        }
-
-        // ── Record attendance ─────────────────────────────────────────────────
-        const attendedAt = new Date();
-        if (existing) {
-            await tx.update(sessionAttendance)
-                .set({ status: "present", attendedAt })
-                .where(eq(sessionAttendance.id, existing.id));
-        } else {
-            await tx.insert(sessionAttendance).values({
-                id: randomUUID(),
-                sessionId,
-                studentId,
-                status: "present",
-                attendedAt,
-            });
-        }
-
-        // ── Unlock lesson content permanently (expiresAt = null) ──────────────
-        if (lessonIdsInSession.length > 0) {
-            const alreadyEnrolled = await tx
-                .select({ lessonId: enrolledItems.lessonId })
-                .from(enrolledItems)
-                .where(and(
-                    eq(enrolledItems.studentId, studentId),
-                    eq(enrolledItems.status, "active"),
-                    inArray(enrolledItems.lessonId, lessonIdsInSession)
-                ));
-
-            const enrolledLessonIdSet = new Set(alreadyEnrolled.map(r => r.lessonId).filter(Boolean));
-
-            const newEnrollments = lessonIdsInSession
-                .filter(id => !enrolledLessonIdSet.has(id))
-                .map(lessonId => ({
-                    id: randomUUID(),
-                    studentId,
-                    lessonId,
-                    status: "active" as const,
-                    expiresAt: null,
-                }));
-
-            if (newEnrollments.length > 0) {
-                await tx.insert(enrolledItems).values(newEnrollments);
-            }
-        }
+        // ── Charge once + record present + unlock lessons ──────────────────────
+        // Same rule as teacher/admin attendance: never charged twice for a session
+        // (e.g. already charged by the 24h job), lessons follow contentAccessDays.
+        // A student with 0 balance can't join (allowUnpaid: false).
+        const lessonIdsInSession = (await getLessonIdsBySession([sessionId], tx)).get(sessionId) || [];
+        await markStudentPresent(tx, studentId, session, lessonIdsInSession, { allowUnpaid: false });
     });
 
     return SuccessResponse(res, { sessionLink: session.sessionLink });

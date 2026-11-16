@@ -97,6 +97,7 @@ export async function deductSingleStudentSession(
                 sessionId,
                 studentId,
                 deductedAt: new Date(),
+                chargeStatus: "free",
             }).catch(() => {});
             return { deducted: false, reason: "re_explanation_exempt" };
         }

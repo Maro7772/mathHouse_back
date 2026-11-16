@@ -176,6 +176,13 @@
       "when": 1794730856648,
       "tag": "0024_popup_active",
       "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "5",
+      "when": 1794838048104,
+      "tag": "0025_session_charge_status",
+      "breakpoints": true
     }
   ]
 }

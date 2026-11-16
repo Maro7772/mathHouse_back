@@ -1746,7 +1746,8 @@ export const manualAttendSessions = async (req: Request, res: Response) => {
                 const sessionLessonIds = lessonsBySession.get(session.id) || [];
 
                 // Enrollment, attendance, balance deduction and lesson unlock (shared with the teacher portal)
-                const { balanceDeducted, lessonsUnlocked: unlockedLessonsCount } =
+                // a student with 0 balance is still marked present, recorded as "unpaid"
+                const { balanceDeducted, chargeStatus, lessonsUnlocked: unlockedLessonsCount } =
                     await markStudentPresent(tx, student.id, session, sessionLessonIds);
 
                 if (balanceDeducted) {
@@ -1758,6 +1759,8 @@ export const manualAttendSessions = async (req: Request, res: Response) => {
                     sessionId: session.id,
                     sessionName: session.name,
                     balanceDeducted,
+                    chargeStatus,
+                    unpaid: chargeStatus === "unpaid",
                     lessonsUnlocked: unlockedLessonsCount,
                 });
             }
@@ -1768,6 +1771,7 @@ export const manualAttendSessions = async (req: Request, res: Response) => {
                 initialLiveBalance: student.livebalance,
                 finalLiveBalance: currentLiveBalance,
                 totalDeductions: totalDeductionsForStudent,
+                unpaidSessions: attendedSessionsList.filter(s => s.unpaid).length,
                 sessions: attendedSessionsList,
             });
         }
@@ -1777,6 +1781,7 @@ export const manualAttendSessions = async (req: Request, res: Response) => {
         message: "Students manual attendance recorded and wallet/sessions updated successfully",
         totalStudentsProcessed: existingStudents.length,
         totalSessionsProcessed: existingSessions.length,
+        totalUnpaid: attendanceResults.reduce((n, r) => n + r.unpaidSessions, 0),
         results: attendanceResults,
     }, 200);
 };

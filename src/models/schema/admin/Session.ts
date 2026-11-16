@@ -141,6 +141,10 @@ export const sessionPackageDeductions = mysqlTable("session_package_deductions",
     sessionId: char("session_id", { length: 36 }).notNull().references(() => sessions.id, { onDelete: "cascade" }),
     studentId: char("student_id", { length: 36 }).notNull().references(() => Student.id, { onDelete: "cascade" }),
     deductedAt: timestamp("deducted_at").defaultNow().notNull(),
+    // "paid"   = 1 live session was taken from the balance
+    // "free"   = Re-Explanation of lessons the student already attended (nothing taken)
+    // "unpaid" = teacher/admin marked the student present while the balance was 0 (nothing taken)
+    chargeStatus: varchar("charge_status", { length: 16 }).notNull().default("paid"),
 }, (table) => [
     uniqueIndex("session_student_deduction_unique").on(table.sessionId, table.studentId),
     index("session_deduction_session_idx").on(table.sessionId),

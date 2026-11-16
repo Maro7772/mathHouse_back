@@ -62,12 +62,16 @@ export const respondToStudentCancelRequest = async (req: Request, res: Response)
 
         await tx.delete(sessionUsers).where(and(eq(sessionUsers.sessionId, request.sessionId), eq(sessionUsers.studentId, request.studentId)));
 
-        const [deduction] = await tx.select({ id: sessionPackageDeductions.id }).from(sessionPackageDeductions)
+        const [deduction] = await tx.select({ id: sessionPackageDeductions.id, chargeStatus: sessionPackageDeductions.chargeStatus })
+            .from(sessionPackageDeductions)
             .where(and(eq(sessionPackageDeductions.sessionId, request.sessionId), eq(sessionPackageDeductions.studentId, request.studentId)));
         if (deduction) {
             await tx.delete(sessionPackageDeductions).where(eq(sessionPackageDeductions.id, deduction.id));
-            await tx.update(Student).set({ livebalance: sql`${Student.livebalance} + 1` }).where(eq(Student.id, request.studentId));
-            refunded = true;
+            // only give back a session that was really taken (not a free Re-Explanation or an unpaid attendance)
+            if (deduction.chargeStatus === "paid") {
+                await tx.update(Student).set({ livebalance: sql`${Student.livebalance} + 1` }).where(eq(Student.id, request.studentId));
+                refunded = true;
+            }
         }
     });
 
