@@ -9,6 +9,20 @@ import { SuccessResponse } from "../../utils/response";
 import { NotFound, UnauthorizedError, BadRequest } from "../../Errors";
 import { checkAccess, resolveAccessIds } from "../../utils/accessControl";
 
+// ── Quiz timing ─────────────────────────────────────────────────────────────
+// started_at used to be filled by the database clock (NOW()), while the end time and every
+// time check use this server's clock. When the two clocks are in different time zones
+// (e.g. database in Cairo, server in UTC) the timer was off by hours. The start time is now
+// always written by this server, and the remaining time is computed here, not in the browser.
+const quizDurationMs = (q: { durationHours: number | null; durationMinutes: number | null }) =>
+    ((q.durationHours || 0) * 60 + (q.durationMinutes || 0)) * 60 * 1000;
+/** Seconds left of an in-progress attempt (null = no time limit). */
+const secondsLeftOf = (startedAt: Date | string, durationMs: number) =>
+    durationMs > 0
+        // never more than the quiz length (an old start time written by the database clock can look like the future)
+        ? Math.min(Math.round(durationMs / 1000), Math.max(0, Math.round((durationMs - (Date.now() - new Date(startedAt).getTime())) / 1000)))
+        : null;
+
 export const getQuizQuestions = async (req: Request, res: Response) => {
     const { quizId } = req.params;
 
@@ -120,7 +134,13 @@ export const getQuizById = async (req: Request, res: Response) => {
             passScore: existingQuiz.passScore,
             questionsCount: questionsCount.length,
         },
-        attempt: existingAttempt ?? null,
+        attempt: existingAttempt
+            ? {
+                ...existingAttempt,
+                // the player counts down from this (null = no time limit)
+                secondsLeft: existingAttempt.status === "in_progress" ? secondsLeftOf(existingAttempt.startedAt, quizDurationMs(existingQuiz)) : null,
+            }
+            : null,
     });
 };
 
@@ -153,10 +173,27 @@ export const startQuiz = async (req: Request, res: Response) => {
         ));
 
     if (existingAttempt) {
-        return SuccessResponse(res, {
-            message: "Quiz already in progress",
-            attempt: existingAttempt,
-        });
+        const durationMs = quizDurationMs(existingQuiz);
+        const elapsed = Date.now() - new Date(existingAttempt.startedAt).getTime();
+        const [{ n: answered }] = await db.select({ n: sql<number>`COUNT(*)` }).from(studentQuizAnswers).where(eq(studentQuizAnswers.attemptId, existingAttempt.id));
+        if (elapsed < 0) {
+            // written with the database clock "in the future": restart the clock now
+            await db.update(quizAttempts).set({ startedAt: new Date() }).where(eq(quizAttempts.id, existingAttempt.id));
+        } else if (durationMs > 0 && elapsed > durationMs + 60_000 && Number(answered) === 0) {
+            // an old, abandoned attempt with no answers: drop it and start fresh below
+            await db.delete(quizAttempts).where(eq(quizAttempts.id, existingAttempt.id));
+        } else {
+            return SuccessResponse(res, {
+                message: "Quiz already in progress",
+                attempt: { ...existingAttempt, secondsLeft: secondsLeftOf(existingAttempt.startedAt, durationMs) },
+            });
+        }
+        if (elapsed < 0) {
+            return SuccessResponse(res, {
+                message: "Quiz already in progress",
+                attempt: { id: existingAttempt.id, startedAt: new Date(), secondsLeft: secondsLeftOf(new Date(), durationMs) },
+            });
+        }
     }
 
     const [passedAttempt] = await db
@@ -175,16 +212,18 @@ export const startQuiz = async (req: Request, res: Response) => {
 
     const attemptId = randomUUID();
 
+    const startedAt = new Date();
     await db.insert(quizAttempts).values({
         id: attemptId,
         studentId,
         quizId,
         status: "in_progress",
+        startedAt, // this server's clock (see "Quiz timing" above)
     });
 
     SuccessResponse(res, {
         message: "Quiz started successfully",
-        attempt: { id: attemptId, quizId },
+        attempt: { id: attemptId, quizId, startedAt, secondsLeft: secondsLeftOf(startedAt, quizDurationMs(existingQuiz)) },
     }, 201);
 };
 
@@ -218,7 +257,7 @@ export const submitQuiz = async (req: Request, res: Response) => {
     const startedAt = new Date(attempt.startedAt).getTime();
     const now = Date.now();
     const durationMs = ((quiz.durationHours || 0) * 60 * 60 * 1000) + ((quiz.durationMinutes || 0) * 60 * 1000);
-    const isTimedOut = durationMs > 0 && (now - startedAt) > durationMs;
+    const isTimedOut = durationMs > 0 && (now - startedAt) > durationMs + 30_000; // 30 s grace for the network
 
     const quizQs = await db
         .select({
