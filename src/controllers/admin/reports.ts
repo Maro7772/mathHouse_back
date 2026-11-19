@@ -132,6 +132,7 @@ export const getStudentQuizReports = async (req: Request, res: Response) => {
                 attemptId: studentQuizAnswers.attemptId,
                 questionId: questions.id,
                 questionText: questions.question,
+                questionImage: questions.image, // every question is a photo
                 lessonId: questions.lessonId,
                 studentSelectedOptionId: studentQuizAnswers.selectedOptionId,
                 studentGridInAnswer: studentQuizAnswers.gridInAnswer,
@@ -221,6 +222,7 @@ export const getStudentQuizReports = async (req: Request, res: Response) => {
         mistakesByAttemptMap.get(m.attemptId)!.push({
             questionId: m.questionId,
             questionText: m.questionText,
+            questionImage: m.questionImage,
             studentSelectedOptionId: m.studentSelectedOptionId,
             studentGridInAnswer: m.studentGridInAnswer,
             correctOption: correctOption ? correctOption.answer : null,
@@ -357,6 +359,7 @@ export const getStudentExamReports = async (req: Request, res: Response) => {
                 attemptId: studentAnswers.attemptId,
                 questionId: questions.id,
                 questionText: questions.question,
+                questionImage: questions.image, // every question is a photo
                 lessonId: questions.lessonId,
                 studentSelectedOptionId: studentAnswers.selectedOptionId,
                 studentGridInAnswer: studentAnswers.gridInAnswer,
@@ -463,6 +466,7 @@ export const getStudentExamReports = async (req: Request, res: Response) => {
         mistakesByAttemptMap.get(m.attemptId)!.push({
             questionId: m.questionId,
             questionText: m.questionText,
+            questionImage: m.questionImage,
             studentSelectedOptionId: m.studentSelectedOptionId,
             studentGridInAnswer: m.studentGridInAnswer,
             correctOption: correctOption ? correctOption.answer : null,

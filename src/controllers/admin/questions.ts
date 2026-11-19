@@ -187,6 +187,7 @@ export const getAllQuestions = async (req: Request, res: Response) => {
     const Allquestions = await db.select({
         id: questions.id,
         question: questions.question,
+        image: questions.image, // most questions are a picture with no text
         answerType: questions.answerType,
         difficulty: questions.difficulty,
         questionType: questions.questionType,
@@ -501,6 +502,7 @@ export const getQuestionsbyLessonId = async (req: Request, res: Response) => {
     const Allquestions = await db.select({
         id: questions.id,
         question: questions.question,
+        image: questions.image, // most questions are a picture with no text
         answerType: questions.answerType,
         difficulty: questions.difficulty,
         questionType: questions.questionType,
@@ -564,9 +566,17 @@ export const getQuestionsbyCourseId = async (req: Request, res: Response) => {
         )
         : undefined;
 
-    const finalCondition = searchCondition
-        ? and(eq(lessons.courseId, courseId), searchCondition)
-        : eq(lessons.courseId, courseId);
+    // same filters as the lesson list (the exam question picker uses them)
+    const difficulty = req.query.difficulty as string | undefined;
+    const year = req.query.year as string | undefined;
+    const month = req.query.month as string | undefined;
+    const finalCondition = and(
+        eq(lessons.courseId, courseId),
+        searchCondition,
+        difficulty ? eq(questions.difficulty, difficulty as any) : undefined,
+        year ? eq(questions.year, parseInt(year)) : undefined,
+        month ? eq(questions.month, month as any) : undefined,
+    );
 
     const [totalQueries] = await db.select({ count: count() })
         .from(questions)
@@ -581,6 +591,7 @@ export const getQuestionsbyCourseId = async (req: Request, res: Response) => {
     const Allquestions = await db.select({
         id: questions.id,
         question: questions.question,
+        image: questions.image, // most questions are a picture with no text
         answerType: questions.answerType,
         difficulty: questions.difficulty,
         questionType: questions.questionType,
@@ -661,6 +672,7 @@ export const getQuestionsbySectiondId = async (req: Request, res: Response) => {
     const Allquestions = await db.select({
         id: questions.id,
         question: questions.question,
+        image: questions.image, // most questions are a picture with no text
         answerType: questions.answerType,
         difficulty: questions.difficulty,
         questionType: questions.questionType,
