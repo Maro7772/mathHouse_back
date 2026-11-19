@@ -24,6 +24,20 @@ import { eq, and, inArray, or, desc } from "drizzle-orm";
 import { SuccessResponse } from "../../utils/response";
 import { NotFound } from "../../Errors";
 
+// ── Which attempt the admin sees ────────────────────────────────────────────
+// A student can retake a quiz/exam they didn't pass. The admin always sees the FIRST finished
+// attempt as the official result (it used to be whichever row the database returned first),
+// plus how many tries there were and the latest result.
+const pickAttempts = <T extends { startedAt: any }>(all: T[], isMine: (a: T) => boolean, isFinished: (a: T) => boolean) => {
+    const mine = all.filter(isMine).sort((x, y) => new Date(x.startedAt).getTime() - new Date(y.startedAt).getTime());
+    const finished = mine.filter(isFinished);
+    return {
+        attempt: finished[0] ?? mine[mine.length - 1] ?? null, // first finished, else the open one
+        attemptsCount: finished.length,
+        latest: finished.length > 1 ? finished[finished.length - 1] : null,
+    };
+};
+
 export const getStudentQuizReports = async (req: Request, res: Response) => {
     const { studentId, courseId } = req.params;
 
@@ -223,7 +237,8 @@ export const getStudentQuizReports = async (req: Request, res: Response) => {
 
     // 9. Construct final report data
     const reportData = allQuizzes.map(quiz => {
-        const attempt = studentAttempts.find(a => a.quizId === quiz.id);
+        const picked = pickAttempts(studentAttempts, a => a.quizId === quiz.id, a => a.status === "completed" || a.status === "timed_out");
+        const attempt = picked.attempt;
 
         let status = "absent";
         let attemptId = null;
@@ -260,6 +275,8 @@ export const getStudentQuizReports = async (req: Request, res: Response) => {
             attemptId,
             score,
             date,
+            attemptsCount: picked.attemptsCount,
+            latestAttempt: picked.latest ? { attemptId: picked.latest.id, score: picked.latest.score, date: picked.latest.endedAt } : null,
             mistakesCount,
             mistakes,
             attendedLesson,
@@ -485,7 +502,8 @@ export const getStudentExamReports = async (req: Request, res: Response) => {
 
     // 6. Map and build final reportData
     const reportData = allExams.map(exam => {
-        const attempt = studentAttempts.find(a => a.examId === exam.id);
+        const picked = pickAttempts(studentAttempts, a => a.examId === exam.id, a => a.status === "completed" || a.status === "timed_out");
+        const attempt = picked.attempt;
 
         let status = "absent";
         let attemptId = null;
@@ -520,6 +538,8 @@ export const getStudentExamReports = async (req: Request, res: Response) => {
             attemptId,
             score,
             date,
+            attemptsCount: picked.attemptsCount,
+            latestAttempt: picked.latest ? { attemptId: picked.latest.id, score: picked.latest.score, date: picked.latest.endedAt } : null,
             mistakesCount,
             mistakes,
             lessonsToRecap
@@ -736,7 +756,8 @@ export const getStudentDiagnosticExamReports = async (req: Request, res: Respons
 
     // 5. Map and build final reportData
     const reportData = allDiagnosticExams.map(exam => {
-        const attempt = studentAttempts.find(a => a.diagnosticExamId === exam.id);
+        const picked = pickAttempts(studentAttempts, a => a.diagnosticExamId === exam.id, a => !!a.isCompleted);
+        const attempt = picked.attempt;
 
         let status = "absent";
         let attemptId = null;
@@ -775,6 +796,8 @@ export const getStudentDiagnosticExamReports = async (req: Request, res: Respons
             attemptId,
             score,
             date,
+            attemptsCount: picked.attemptsCount,
+            latestAttempt: picked.latest ? { attemptId: picked.latest.id, score: picked.latest.score, date: picked.latest.endedAt } : null,
             mistakesCount,
             mistakes,
             lessonsToRecap

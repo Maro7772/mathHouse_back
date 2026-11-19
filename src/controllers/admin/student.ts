@@ -250,7 +250,12 @@ export const getStudentById = async (req: Request, res: Response) => {
         .where(or(...examWhereConditions));
 
     const studentExams = allExams.map(exam => {
-        const attempt = studentExamAttempts.find(a => a.examId === exam.id);
+        // first finished attempt = the official result (retakes are counted, not shown instead of it)
+        const mine = studentExamAttempts
+            .filter(a => a.examId === exam.id)
+            .sort((x, y) => new Date(x.startedAt as any).getTime() - new Date(y.startedAt as any).getTime());
+        const finished = mine.filter(a => a.status === "completed" || a.status === "timed_out");
+        const attempt = finished[0] ?? mine[mine.length - 1];
         let status = "absent";
         let score = null;
         let attemptId = null;

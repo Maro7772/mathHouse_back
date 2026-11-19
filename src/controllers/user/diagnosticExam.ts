@@ -1,4 +1,5 @@
 import { Request, Response } from "express";
+import { resolveSolutionVideo } from "../../utils/mistakes";
 import { SuccessResponse } from "../../utils/response";
 import { db } from "../../models/connection";
 import { courses, diagnosticExam, diagnosticExamQuestions, questions, questionOptions, diagnosticExamAttempt, studentDiagnosticAnswers, rawScore, questionAnswers, lessons, chapters } from "../../models/schema";
@@ -487,6 +488,7 @@ export const getDiagnosticAttemptReview = async (req: Request, res: Response) =>
             id: e.id,
             answerPdf: e.answerPdf,
             answerVideo: e.answerVideo,
+            video: resolveSolutionVideo(e.answerVideo),
             answerImage: e.answerImage,
             answerText: e.answerText,
         });

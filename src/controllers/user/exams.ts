@@ -1,4 +1,5 @@
 import { Request, Response } from "express";
+import { resolveSolutionVideo } from "../../utils/mistakes";
 import { db } from "../../models/connection";
 import { Exams, ExamSections, SectionQuestions } from "../../models/schema/admin/exams";
 import { examAttempts, sectionAttempts } from "../../models/schema/admin/examAttempts";
@@ -560,6 +561,7 @@ export const submitExam = async (req: Request, res: Response) => {
                 id: m.id,
                 answerPdf: m.pdf,
                 answerVideo: m.video,
+                video: resolveSolutionVideo(m.video), // playable: { type: "bunny", streamUrl } | { type: "external", url }
                 answerImage: m.image,
                 answerText: m.text,
             });
@@ -1009,10 +1011,10 @@ export const getExamAttemptAnswers = async (req: Request, res: Response) => {
 
     const correctOptMap = new Map(correctOptions.map(o => [o.questionId, o]));
 
-    const explanationsMap = new Map<string, typeof explanations>();
+    const explanationsMap = new Map<string, any[]>();
     for (const exp of explanations) {
         const list = explanationsMap.get(exp.questionId) ?? [];
-        list.push(exp);
+        list.push({ ...exp, video: resolveSolutionVideo(exp.answerVideo) });
         explanationsMap.set(exp.questionId, list);
     }
 
@@ -1141,7 +1143,7 @@ export const showQuestionAnswer = async (req: Request, res: Response) => {
         result: {
             correctOptions,
             studentAnswer: latestStudentAnswer ?? req.body.studentAnswer ?? null,
-            explanation: answers ?? [] // array of answer objects: [{ id, answerPdf, answerVideo, answerImage, answerText }]
+            explanation: (answers ?? []).map((a: any) => ({ ...a, video: resolveSolutionVideo(a.answerVideo) })), // array of answer objects: [{ id, answerPdf, answerVideo, answerImage, answerText }]
         },
     });
 };
@@ -1595,6 +1597,7 @@ export const submitSection = async (req: Request, res: Response) => {
                 id: m.id,
                 answerPdf: m.pdf,
                 answerVideo: m.video,
+                video: resolveSolutionVideo(m.video), // playable: { type: "bunny", streamUrl } | { type: "external", url }
                 answerImage: m.image,
                 answerText: m.text,
             });
