@@ -183,6 +183,13 @@
       "when": 1794838048104,
       "tag": "0025_session_charge_status",
       "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "5",
+      "when": 1795076680621,
+      "tag": "0026_lesson_attendance_exam_assign",
+      "breakpoints": true
     }
   ]
 }

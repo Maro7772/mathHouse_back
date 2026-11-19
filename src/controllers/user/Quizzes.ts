@@ -1,7 +1,8 @@
 import { Request, Response } from "express";
 import { eq, and, inArray, asc, desc, or, isNull, gt, sql } from "drizzle-orm";
 import { db } from "../../models/connection";
-import { quizzes, questions, quizQuestions, questionOptions, quizAttempts, studentQuizAnswers, lessons, Student, enrolledItems, chapters, courses } from "../../models/schema";
+import { quizzes, questions, quizQuestions, questionOptions, questionAnswers, quizAttempts, studentQuizAnswers, lessons, Student, enrolledItems, chapters, courses } from "../../models/schema";
+import { hasMistakesAccess, resolveSolutionVideo } from "../../utils/mistakes";
 import { randomUUID } from "crypto";
 import { isEquivalentGridInAnswer } from "../../utils/checkGridInAnswer";
 import { SuccessResponse } from "../../utils/response";
@@ -42,7 +43,7 @@ export const getQuizQuestions = async (req: Request, res: Response) => {
     }).from(quizQuestions)
         .innerJoin(questions, eq(quizQuestions.questionId, questions.id))
         .where(eq(quizQuestions.quizId, quizId))
-        .orderBy(questions.createdAt);
+        .orderBy(asc(quizQuestions.questionOrder), asc(questions.createdAt));
 
     const questionIds = AllQuizQuestions.map(q => q.question.id);
 
@@ -376,15 +377,34 @@ export const getQuizzesByLessonId = async (req: Request, res: Response) => {
             durationHours: quizzes.durationHours,
             durationMinutes: quizzes.durationMinutes,
             totalScore: quizzes.totalScore,
+            passScore: quizzes.passScore,
             quizOrder: quizzes.quizOrder,
         })
         .from(quizzes)
-        .where(eq(quizzes.lessonId, lessonId))
+        .where(and(eq(quizzes.lessonId, lessonId), eq(quizzes.isActive, true)))
         .orderBy(asc(quizzes.quizOrder));
+
+    // latest finished attempt per quiz → the lesson page can show the score and open the result
+    const attempts = lessonQuizzes.length
+        ? await db
+            .select({ id: quizAttempts.id, quizId: quizAttempts.quizId, score: quizAttempts.score, isPassed: quizAttempts.isPassed, endedAt: quizAttempts.endedAt })
+            .from(quizAttempts)
+            .where(and(
+                eq(quizAttempts.studentId, studentId),
+                inArray(quizAttempts.quizId, lessonQuizzes.map(q => q.id)),
+                inArray(quizAttempts.status, ["completed", "timed_out"]),
+            ))
+            .orderBy(desc(quizAttempts.endedAt))
+        : [];
+    const latest = new Map<string, (typeof attempts)[number]>();
+    for (const a of attempts) if (!latest.has(a.quizId)) latest.set(a.quizId, a);
 
     return SuccessResponse(res, {
         message: "Lesson quizzes fetched successfully",
-        quizzes: lessonQuizzes
+        quizzes: lessonQuizzes.map(q => {
+            const a = latest.get(q.id);
+            return { ...q, lastAttempt: a ? { id: a.id, score: a.score, isPassed: !!a.isPassed, endedAt: a.endedAt } : null };
+        }),
     }, 200);
 };
 
@@ -724,4 +744,91 @@ export const getRemainingHomework = async (req: Request, res: Response) => {
         count: formattedQuizzes.length,
         quizzes: formattedQuizzes,
     }, 200);
+};
+
+// ===================== QUIZ RESULT (after submit) =====================
+/**
+ * GET /api/user/quizzes/attempts/:attemptId/result
+ * → { attempt: { score, totalScore, passScore, isPassed, status, correct, wrong, unanswered, total, ... },
+ *     quiz: { id, title, lessonId, lessonName }, mistakesUnlocked,
+ *     questions: [{ questionId, question, image, answerType, isCorrect, answered }],          (always)
+ *     mistakes: [{ ...question, options, selectedOptionId, gridInAnswer, correctAnswers, solutions }] }  (only if mistakes bought)
+ */
+export const getQuizAttemptResult = async (req: Request, res: Response) => {
+    const studentId = req.user.id;
+    const { attemptId } = req.params;
+
+    const [attempt] = await db
+        .select({
+            id: quizAttempts.id, quizId: quizAttempts.quizId, status: quizAttempts.status, score: quizAttempts.score,
+            isPassed: quizAttempts.isPassed, startedAt: quizAttempts.startedAt, endedAt: quizAttempts.endedAt,
+        })
+        .from(quizAttempts)
+        .where(and(eq(quizAttempts.id, attemptId), eq(quizAttempts.studentId, studentId)))
+        .limit(1);
+    if (!attempt) throw new NotFound("Quiz attempt not found");
+    if (attempt.status === "in_progress") throw new BadRequest("This quiz is not submitted yet");
+
+    const [quiz] = await db
+        .select({ id: quizzes.id, title: quizzes.title, totalScore: quizzes.totalScore, passScore: quizzes.passScore, lessonId: quizzes.lessonId, lessonName: lessons.name })
+        .from(quizzes)
+        .leftJoin(lessons, eq(lessons.id, quizzes.lessonId))
+        .where(eq(quizzes.id, attempt.quizId));
+    if (!quiz) throw new NotFound("Quiz not found");
+
+    const qs = await db
+        .select({ questionId: quizQuestions.questionId, order: quizQuestions.questionOrder, question: questions.question, image: questions.image, answerType: questions.answerType })
+        .from(quizQuestions)
+        .innerJoin(questions, eq(questions.id, quizQuestions.questionId))
+        .where(eq(quizQuestions.quizId, quiz.id))
+        .orderBy(asc(quizQuestions.questionOrder));
+    const answers = await db
+        .select({ questionId: studentQuizAnswers.questionId, selectedOptionId: studentQuizAnswers.selectedOptionId, gridInAnswer: studentQuizAnswers.gridInAnswer, isCorrect: studentQuizAnswers.isCorrect })
+        .from(studentQuizAnswers)
+        .where(eq(studentQuizAnswers.attemptId, attempt.id));
+    const answerOf = new Map(answers.map(a => [a.questionId, a]));
+
+    const perQuestion = qs.map((q, i) => {
+        const a = answerOf.get(q.questionId);
+        const answered = !!a && (!!a.selectedOptionId || !!(a.gridInAnswer && a.gridInAnswer.trim()));
+        return { number: i + 1, questionId: q.questionId, question: q.question, image: q.image, answerType: q.answerType, answered, isCorrect: !!a?.isCorrect, selectedOptionId: a?.selectedOptionId ?? null, gridInAnswer: a?.gridInAnswer ?? null };
+    });
+    const correct = perQuestion.filter(q => q.isCorrect).length;
+    const unanswered = perQuestion.filter(q => !q.answered).length;
+
+    const mistakesUnlocked = await hasMistakesAccess(studentId);
+    const wrong = perQuestion.filter(q => !q.isCorrect);
+    let mistakes: any[] = [];
+    if (mistakesUnlocked && wrong.length) {
+        const ids = wrong.map(q => q.questionId);
+        const [opts, sols] = await Promise.all([
+            db.select({ id: questionOptions.id, questionId: questionOptions.questionId, answer: questionOptions.answer, isCorrect: questionOptions.isCorrect, order: questionOptions.order })
+                .from(questionOptions).where(inArray(questionOptions.questionId, ids)),
+            db.select({ id: questionAnswers.id, questionId: questionAnswers.questionId, pdf: questionAnswers.pdf, video: questionAnswers.video, image: questionAnswers.image, text: questionAnswers.text })
+                .from(questionAnswers).where(inArray(questionAnswers.questionId, ids)),
+        ]);
+        mistakes = wrong.map(q => {
+            const options = opts.filter(o => o.questionId === q.questionId).sort((a, b) => String(a.order).localeCompare(String(b.order)));
+            return {
+                ...q,
+                options: options.map(o => ({ id: o.id, answer: o.answer, order: o.order, isCorrect: o.isCorrect })),
+                correctAnswers: options.filter(o => o.isCorrect).map(o => o.answer),
+                solutions: sols.filter(s => s.questionId === q.questionId).map(s => ({
+                    id: s.id, text: s.text, image: s.image, pdf: s.pdf, video: resolveSolutionVideo(s.video),
+                })),
+            };
+        });
+    }
+
+    return SuccessResponse(res, {
+        attempt: {
+            id: attempt.id, status: attempt.status, score: attempt.score ?? 0, totalScore: quiz.totalScore, passScore: quiz.passScore,
+            isPassed: !!attempt.isPassed, startedAt: attempt.startedAt, endedAt: attempt.endedAt,
+            total: perQuestion.length, correct, wrong: perQuestion.length - correct - unanswered, unanswered,
+        },
+        quiz: { id: quiz.id, title: quiz.title, lessonId: quiz.lessonId, lessonName: quiz.lessonName },
+        mistakesUnlocked,
+        questions: perQuestion.map(({ selectedOptionId, gridInAnswer, ...q }) => q),
+        mistakes,
+    });
 };

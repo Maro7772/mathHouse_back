@@ -1,10 +1,12 @@
-import { mysqlTable, char, varchar, timestamp, int, boolean, foreignKey, mysqlEnum, json } from "drizzle-orm/mysql-core";
+import { mysqlTable, char, varchar, timestamp, int, boolean, foreignKey, mysqlEnum, json, uniqueIndex, index } from "drizzle-orm/mysql-core";
 import { sql } from "drizzle-orm";
 import { questions } from "./questions";
 import { rawScore } from "./rawScore";
 import { courses } from "./courses";
 import { examCodes } from "./examCodes";
 import { Sections } from "./sections";
+import { Student } from "./Student";
+import { groups } from "./Groups";
 
 export const examType = mysqlEnum("exam_type", ["static", "adaptive"]).notNull();
 
@@ -67,3 +69,28 @@ export const AdaptiveExam = mysqlTable("adaptive_exam", {
     createdAt: timestamp("created_at").defaultNow(),
     updatedAt: timestamp("updated_at").defaultNow().onUpdateNow(),
 });
+/**
+ * Exam assignment: an admin gives an exam to specific students and/or whole groups.
+ * Assigned students always see the exam (even with 0 exam balance) and start it for free.
+ */
+export const examStudents = mysqlTable("exam_students", {
+    id: char("id", { length: 36 }).primaryKey().default(sql`(UUID())`),
+    examId: char("exam_id", { length: 255 }).notNull().references(() => Exams.id, { onDelete: "cascade" }),
+    studentId: char("student_id", { length: 36 }).notNull().references(() => Student.id, { onDelete: "cascade" }),
+    assignedBy: char("assigned_by", { length: 36 }),
+    createdAt: timestamp("created_at").defaultNow(),
+}, (t) => [
+    uniqueIndex("exam_students_unique").on(t.examId, t.studentId),
+    index("exam_students_student_idx").on(t.studentId),
+]);
+
+export const examGroups = mysqlTable("exam_groups", {
+    id: char("id", { length: 36 }).primaryKey().default(sql`(UUID())`),
+    examId: char("exam_id", { length: 255 }).notNull().references(() => Exams.id, { onDelete: "cascade" }),
+    groupId: char("group_id", { length: 36 }).notNull().references(() => groups.id, { onDelete: "cascade" }),
+    assignedBy: char("assigned_by", { length: 36 }),
+    createdAt: timestamp("created_at").defaultNow(),
+}, (t) => [
+    uniqueIndex("exam_groups_unique").on(t.examId, t.groupId),
+    index("exam_groups_group_idx").on(t.groupId),
+]);

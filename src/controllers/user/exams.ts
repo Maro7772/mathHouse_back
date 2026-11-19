@@ -14,11 +14,12 @@ import { examCodes } from "../../models/schema/admin/examCodes";
 import { studentParallelAttempts } from "../../models/schema/admin/studentParallelAttempts";
 import { studentParallelAnswers } from "../../models/schema/admin/studentParallelAnswers";
 import { payment } from "../../models/schema/admin/payment";
-import { eq, and, inArray, sql, desc, isNull } from "drizzle-orm";
+import { eq, and, or, inArray, sql, desc, isNull } from "drizzle-orm";
 import { SuccessResponse } from "../../utils/response";
 import { BadRequest, NotFound, UnauthorizedError } from "../../Errors";
 import { randomUUID } from "crypto";
 import { isEquivalentGridInAnswer } from "../../utils/checkGridInAnswer";
+import { getAssignedExamIds, isExamAssigned } from "../../utils/examAssignments";
 
 const getStudentId = (req: Request): string => {
     if (!req.user?.id) throw new UnauthorizedError("Not authenticated");
@@ -37,7 +38,10 @@ export const getExams = async (req: Request, res: Response) => {
 
     if (!student) throw new NotFound("Student not found");
 
-    if (student.examBalance <= 0) {
+    // Exams an admin assigned (directly or via a group) are always listed, even with 0 balance.
+    const assignedIds = await getAssignedExamIds(studentId);
+    const hasBalance = student.examBalance > 0;
+    if (!hasBalance && assignedIds.size === 0) {
         throw new BadRequest("You do not have balance, please try to purchase an exam package.");
     }
 
@@ -89,8 +93,8 @@ export const getExams = async (req: Request, res: Response) => {
 
     const courseIds = studentCourses.map(c => c.id);
 
-    // If no courses found, return early with empty courses
-    if (courseIds.length === 0) {
+    // If no courses found and nothing assigned, return early with empty courses
+    if (courseIds.length === 0 && assignedIds.size === 0) {
         return SuccessResponse(res, {
             examBalance: student.examBalance,
             courses: [],
@@ -120,10 +124,28 @@ export const getExams = async (req: Request, res: Response) => {
         .leftJoin(courses, eq(Exams.courseId, courses.id))
         .leftJoin(examCodes, eq(Exams.codeId, examCodes.id))
         .where(and(
-            inArray(Exams.courseId, courseIds),
             eq(Exams.isActive, true),
+            or(
+                // category exams need exam balance; assigned exams don't
+                hasBalance && courseIds.length ? inArray(Exams.courseId, courseIds) : sql`false`,
+                assignedIds.size ? inArray(Exams.id, [...assignedIds]) : sql`false`,
+            ),
         ))
         .orderBy(Exams.createdAt);
+
+    // assigned exams can belong to a course outside the student's category: add those courses too
+    const missingCourseIds = [...new Set(exams.map(e => e.courseId).filter(id => id && !courseIds.includes(id)))] as string[];
+    if (missingCourseIds.length) {
+        const extra = await db
+            .select({
+                id: courses.id, name: courses.name, categoryId: courses.categoryId, description: courses.description,
+                image: courses.image, preRequisition: courses.preRequisition, whatYouGain: courses.whatYouGain,
+                isHaveSemester: courses.isHaveSemester, createdAt: courses.createdAt, updatedAt: courses.updatedAt,
+            })
+            .from(courses)
+            .where(inArray(courses.id, missingCourseIds));
+        studentCourses.push(...extra);
+    }
 
     // 5. Get attempts for status mapping
     const examIds = exams.map(e => e.id);
@@ -156,6 +178,7 @@ export const getExams = async (req: Request, res: Response) => {
     // Map attempts back to exams
     const examsWithStatus = exams.map(exam => ({
         ...exam,
+        assigned: assignedIds.has(exam.id), // assigned exams start without using exam balance
         attempt: attemptsMap.get(exam.id) ?? null,
     }));
 
@@ -170,10 +193,13 @@ export const getExams = async (req: Request, res: Response) => {
     }
 
     // Nest exams inside their corresponding courses
-    const coursesWithExams = studentCourses.map(course => ({
-        ...course,
-        exams: examsByCourse.get(course.id) ?? [],
-    }));
+    const coursesWithExams = studentCourses
+        .map(course => ({
+            ...course,
+            exams: examsByCourse.get(course.id) ?? [],
+        }))
+        // with no balance only courses that hold an assigned exam are shown
+        .filter(course => hasBalance || course.exams.length > 0);
 
     return SuccessResponse(res, {
         examBalance: student.examBalance,
@@ -194,7 +220,8 @@ export const getExamById = async (req: Request, res: Response) => {
 
     if (!student) throw new NotFound("Student not found");
 
-    if (student.examBalance <= 0) {
+    const assigned = await isExamAssigned(studentId, examId);
+    if (!assigned && student.examBalance <= 0) {
         throw new BadRequest("You do not have balance, please try to purchase an exam package.");
     }
 
@@ -250,7 +277,7 @@ export const getExamById = async (req: Request, res: Response) => {
         if (!categoryIds.includes(c.id)) categoryIds.push(c.id);
     });
 
-    if (!categoryIds.includes(exam.courseCategoryId!)) {
+    if (!assigned && !categoryIds.includes(exam.courseCategoryId!)) {
         throw new BadRequest("This exam is not available for your category");
     }
 
@@ -381,6 +408,9 @@ export const startExam = async (req: Request, res: Response) => {
 
     if (!student) throw new NotFound("Student not found");
 
+    // assigned by an admin → no category check and no exam balance used
+    const assigned = await isExamAssigned(studentId, examId);
+
     // 3. Verify category access (Ancestors + Children)
     const categoryIds: string[] = [];
     let currentCategoryId: string | null = student.categoryId;
@@ -404,7 +434,7 @@ export const startExam = async (req: Request, res: Response) => {
         if (!categoryIds.includes(c.id)) categoryIds.push(c.id);
     });
 
-    if (!categoryIds.includes(exam.courseCategoryId!)) {
+    if (!assigned && !categoryIds.includes(exam.courseCategoryId!)) {
         throw new BadRequest("This exam is not available for your category");
     }
 
@@ -446,7 +476,7 @@ export const startExam = async (req: Request, res: Response) => {
     }
 
     // Check balance only for new attempts
-    if (student.examBalance <= 0) throw new BadRequest("You do not have balance, please try to purchase an exam package.");
+    if (!assigned && student.examBalance <= 0) throw new BadRequest("You do not have balance, please try to purchase an exam package.");
 
     // 6. Create attempt and deduct balance in a transaction
     const attemptId = randomUUID();
@@ -461,10 +491,12 @@ export const startExam = async (req: Request, res: Response) => {
             startedAt: startTime,
         });
 
-        await tx
-            .update(Student)
-            .set({ exambalance: sql`${Student.exambalance} - 1` })
-            .where(eq(Student.id, studentId));
+        if (!assigned) {
+            await tx
+                .update(Student)
+                .set({ exambalance: sql`${Student.exambalance} - 1` })
+                .where(eq(Student.id, studentId));
+        }
     });
 
     return SuccessResponse(res, {

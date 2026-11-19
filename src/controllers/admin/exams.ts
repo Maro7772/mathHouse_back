@@ -1,4 +1,5 @@
 import { Request, Response } from "express";
+import { getAssignmentCounts } from "../../utils/examAssignments";
 import { db } from "../../models/connection";
 import { Exams, ExamSections, SectionQuestions } from "../../models/schema/admin/exams";
 import { eq, inArray } from "drizzle-orm";
@@ -362,8 +363,10 @@ export const getAllExams = async (req: Request, res: Response) => {
         .leftJoin(rawScore, eq(Exams.rawScoreId, rawScore.id))
         .leftJoin(category, eq(courses.categoryId, category.id))
 
-    const staticExams = allExams.filter(e => e.examType === "static");
-    const adaptiveExams = allExams.filter(e => e.examType === "adaptive");
+    const counts = await getAssignmentCounts(allExams.map(e => e.id));
+    const withCounts = allExams.map(e => ({ ...e, assignedStudents: counts.get(e.id)?.students ?? 0, assignedGroups: counts.get(e.id)?.groups ?? 0 }));
+    const staticExams = withCounts.filter(e => e.examType === "static");
+    const adaptiveExams = withCounts.filter(e => e.examType === "adaptive");
 
     return SuccessResponse(res, {
         message: "Exams fetched successfully",
@@ -556,8 +559,10 @@ export const getExamsByCourseId = async (req: Request, res: Response) => {
         .leftJoin(category, eq(courses.categoryId, category.id))
         .where(eq(Exams.courseId, courseId));
 
-    const staticExams = courseExams.filter(e => e.examType === "static");
-    const adaptiveExams = courseExams.filter(e => e.examType === "adaptive");
+    const counts = await getAssignmentCounts(courseExams.map(e => e.id));
+    const withCounts = courseExams.map(e => ({ ...e, assignedStudents: counts.get(e.id)?.students ?? 0, assignedGroups: counts.get(e.id)?.groups ?? 0 }));
+    const staticExams = withCounts.filter(e => e.examType === "static");
+    const adaptiveExams = withCounts.filter(e => e.examType === "adaptive");
 
     return SuccessResponse(res, {
         message: "Course exams fetched successfully",

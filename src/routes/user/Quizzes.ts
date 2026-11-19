@@ -1,10 +1,11 @@
 import { Router } from "express";
-import { getQuizQuestions, getQuizById, startQuiz, submitQuiz, getQuizzesByLessonId, getRemainingHomework } from "../../controllers/user/Quizzes";
+import { getQuizQuestions, getQuizById, startQuiz, submitQuiz, getQuizzesByLessonId, getRemainingHomework, getQuizAttemptResult } from "../../controllers/user/Quizzes";
 import { catchAsync } from "../../utils/catchAsync";
 
 const router = Router();
 router.get("/remaining-homework", catchAsync(getRemainingHomework));
 router.get("/lesson/:lessonId", catchAsync(getQuizzesByLessonId));
+router.get("/attempts/:attemptId/result", catchAsync(getQuizAttemptResult));
 router.get("/:quizId", catchAsync(getQuizById));
 router.get("/:quizId/questions", catchAsync(getQuizQuestions));
 router.post("/:quizId/start", catchAsync(startQuiz));

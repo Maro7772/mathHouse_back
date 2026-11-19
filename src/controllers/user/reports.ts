@@ -1,4 +1,7 @@
 import { Request, Response } from "express";
+import { getAssignedExamIds } from "../../utils/examAssignments";
+import { hasMistakesAccess, resolveSolutionVideo } from "../../utils/mistakes";
+import { studentLessonAttendance as lessonSheet } from "../../models/schema/admin/lessonAttendance";
 import { db } from "../../models/connection";
 import {
     quizAttempts,
@@ -15,13 +18,15 @@ import {
     enrolledItems,
     category,
     Exams,
+    ExamSections,
+    SectionQuestions,
     examAttempts,
     studentAnswers,
     diagnosticExam,
     diagnosticExamAttempt,
     studentDiagnosticAnswers
 } from "../../models/schema";
-import { eq, and, inArray, or, desc } from "drizzle-orm";
+import { eq, and, inArray, or, desc, sql } from "drizzle-orm";
 import { SuccessResponse } from "../../utils/response";
 import { NotFound, UnauthorizedError } from "../../Errors";
 
@@ -56,11 +61,6 @@ export const getStudentQuizReports = async (req: Request, res: Response) => {
         eq(courses.categoryId, studentCategory)
     ];
 
-    // Filter by courseId if provided
-    if (courseId) {
-        whereConditions.push(eq(quizzes.courseId, courseId));
-    }
-
     if (attemptQuizIds.length > 0) {
         whereConditions.push(inArray(quizzes.id, attemptQuizIds));
     }
@@ -80,7 +80,11 @@ export const getStudentQuizReports = async (req: Request, res: Response) => {
         })
         .from(quizzes)
         .leftJoin(courses, eq(quizzes.courseId, courses.id))
-        .where(or(...whereConditions));
+        .where(and(
+            or(...whereConditions),
+            eq(quizzes.isActive, true),
+            courseId ? eq(quizzes.courseId, courseId) : undefined, // subject chip
+        ));
 
     // 3. Gather all unique lesson IDs from quizzes
     const lessonIds = Array.from(new Set(allQuizzes.map(q => q.lessonId).filter((id): id is string => !!id)));
@@ -112,6 +116,11 @@ export const getStudentQuizReports = async (req: Request, res: Response) => {
                 )
             );
         attendedLessonIds = new Set(studentLessonAttendance.map(a => a.lessonId));
+        const sheet = await db
+            .select({ lessonId: lessonSheet.lessonId })
+            .from(lessonSheet)
+            .where(and(eq(lessonSheet.studentId, studentId), eq(lessonSheet.status, "present"), inArray(lessonSheet.lessonId, lessonIds)));
+        sheet.forEach(r => attendedLessonIds.add(r.lessonId));
     }
 
     // 6. Gather completed attempt IDs to fetch mistakes
@@ -126,6 +135,8 @@ export const getStudentQuizReports = async (req: Request, res: Response) => {
                 attemptId: studentQuizAnswers.attemptId,
                 questionId: questions.id,
                 questionText: questions.question,
+                questionImage: questions.image,
+                answerType: questions.answerType,
                 lessonId: questions.lessonId,
                 studentSelectedOptionId: studentQuizAnswers.selectedOptionId,
                 studentGridInAnswer: studentQuizAnswers.gridInAnswer,
@@ -183,7 +194,8 @@ export const getStudentQuizReports = async (req: Request, res: Response) => {
         rightSolutionsMap.get(s.questionId)!.push({
             id: s.id,
             answerPdf: s.pdf,
-            answerVideo: s.video,
+            answerVideo: /^https?:\/\//i.test(s.video || "") ? s.video : null,
+            video: resolveSolutionVideo(s.video), // { type: "bunny", streamUrl } | { type: "external", url } | null
             answerImage: s.image,
             answerText: s.text,
         });
@@ -215,11 +227,14 @@ export const getStudentQuizReports = async (req: Request, res: Response) => {
         mistakesByAttemptMap.get(m.attemptId)!.push({
             questionId: m.questionId,
             questionText: m.questionText,
+            questionImage: m.questionImage,
+            answerType: m.answerType,
+            attendedLesson: m.lessonId ? attendedLessonIds.has(m.lessonId) : false,
             studentSelectedOptionId: m.studentSelectedOptionId,
             studentGridInAnswer: m.studentGridInAnswer,
             correctOption: correctOption ? correctOption.answer : null,
             studentOption: studentOption ? studentOption.answer : null,
-            options: qOptions.map(({ questionId, isCorrect, ...rest }) => rest),
+            options: qOptions.map(({ questionId, ...rest }) => rest), // isCorrect kept: options are often images with no text, so the right one is found by the flag
             answers: rightSolution, // array of [{ id, answerPdf, answerVideo, answerImage, answerText }]
             lesson: lessonDetail ? {
                 id: lessonDetail.id,
@@ -229,9 +244,14 @@ export const getStudentQuizReports = async (req: Request, res: Response) => {
         });
     });
 
+    // "buying mistakes" = a package with answers; without it the score and the number of mistakes still show
+    const mistakesUnlocked = await hasMistakesAccess(studentId);
+
     // 9. Construct final report data
     const reportData = allQuizzes.map(quiz => {
-        const attempt = studentAttempts.find(a => a.quizId === quiz.id);
+        const attempt = studentAttempts
+            .filter(a => a.quizId === quiz.id)
+            .sort((a, b) => new Date(b.startedAt as any).getTime() - new Date(a.startedAt as any).getTime())[0];
 
         let status = "absent";
         let attemptId = null;
@@ -246,8 +266,9 @@ export const getStudentQuizReports = async (req: Request, res: Response) => {
                 attemptId = attempt.id;
                 score = attempt.score;
                 date = attempt.endedAt;
-                mistakes = mistakesByAttemptMap.get(attempt.id) || [];
-                mistakesCount = mistakes.length;
+                const found = mistakesByAttemptMap.get(attempt.id) || [];
+                mistakesCount = found.length;
+                mistakes = mistakesUnlocked ? found : [];
             } else if (attempt.status === "in_progress") {
                 status = "waiting";
                 attemptId = attempt.id;
@@ -293,7 +314,8 @@ export const getStudentQuizReports = async (req: Request, res: Response) => {
     return SuccessResponse(res, {
         message: "Quiz reports retrieved successfully",
         data: reportData,
-        courses: studentCourses
+        courses: studentCourses,
+        mistakesUnlocked, // false → show "buy mistakes" instead of the solutions
     });
 };
 
@@ -381,6 +403,11 @@ export const getStudentExamReports = async (req: Request, res: Response) => {
     if (attemptExamIds.length > 0) {
         whereConditions.push(inArray(Exams.id, attemptExamIds));
     }
+    // exams an admin assigned to this student (directly or through a group)
+    const assignedIds = await getAssignedExamIds(studentId);
+    if (assignedIds.size > 0) {
+        whereConditions.push(inArray(Exams.id, [...assignedIds]));
+    }
 
     const allExams = whereConditions.length > 0
         ? await db
@@ -390,14 +417,33 @@ export const getStudentExamReports = async (req: Request, res: Response) => {
                 description: Exams.description,
                 totalScore: Exams.totalScore,
                 passScore: Exams.passScore,
+                duration: Exams.duration,
                 isActive: Exams.isActive,
                 courseId: Exams.courseId,
                 courseName: courses.name,
             })
             .from(Exams)
             .innerJoin(courses, eq(Exams.courseId, courses.id))
-            .where(or(...whereConditions))
+            // closed exams stay listed only if the student already took them
+            .where(and(
+                or(...whereConditions),
+                attemptExamIds.length ? or(eq(Exams.isActive, true), inArray(Exams.id, attemptExamIds)) : eq(Exams.isActive, true),
+            ))
         : [];
+
+    // number of questions per exam → "correct x / y"
+    const questionCounts = new Map<string, number>();
+    if (allExams.length) {
+        const qc = await db
+            .select({ examId: ExamSections.examId, n: sql<number>`COUNT(${SectionQuestions.id})` })
+            .from(ExamSections)
+            .innerJoin(SectionQuestions, eq(SectionQuestions.sectionId, ExamSections.id))
+            .where(inArray(ExamSections.examId, allExams.map(e => e.id)))
+            .groupBy(ExamSections.examId);
+        qc.forEach(r => questionCounts.set(r.examId, Number(r.n) || 0));
+    }
+    // "buying mistakes" = a package with answers (same rule as the exam answers page and quiz mistakes)
+    const mistakesUnlocked = await hasMistakesAccess(studentId);
 
     // 4. Gather completed attempt IDs to fetch mistakes
     const completedAttemptIds = studentAttempts
@@ -456,6 +502,11 @@ export const getStudentExamReports = async (req: Request, res: Response) => {
                 )
             );
         attendedLessonIds = new Set(studentLessonAttendance.map(a => a.lessonId));
+        const sheet = await db
+            .select({ lessonId: lessonSheet.lessonId })
+            .from(lessonSheet)
+            .where(and(eq(lessonSheet.studentId, studentId), eq(lessonSheet.status, "present"), inArray(lessonSheet.lessonId, lessonIds)));
+        sheet.forEach(r => attendedLessonIds.add(r.lessonId));
     }
 
     let allOptions: any[] = [];
@@ -497,7 +548,8 @@ export const getStudentExamReports = async (req: Request, res: Response) => {
         rightSolutionsMap.get(s.questionId)!.push({
             id: s.id,
             answerPdf: s.pdf,
-            answerVideo: s.video,
+            answerVideo: /^https?:\/\//i.test(s.video || "") ? s.video : null,
+            video: resolveSolutionVideo(s.video), // { type: "bunny", streamUrl } | { type: "external", url } | null
             answerImage: s.image,
             answerText: s.text,
         });
@@ -523,7 +575,7 @@ export const getStudentExamReports = async (req: Request, res: Response) => {
             studentGridInAnswer: m.studentGridInAnswer,
             correctOption: correctOption ? correctOption.answer : null,
             studentOption: studentOption ? studentOption.answer : null,
-            options: qOptions.map(({ questionId, isCorrect, ...rest }) => rest),
+            options: qOptions.map(({ questionId, ...rest }) => rest),
             answers: rightSolution,
             lesson: lessonDetail ? {
                 id: lessonDetail.id,
@@ -552,9 +604,10 @@ export const getStudentExamReports = async (req: Request, res: Response) => {
                 attemptId = attempt.id;
                 score = attempt.score;
                 date = attempt.endedAt;
-                mistakes = mistakesByAttemptMap.get(attempt.id) || [];
-                mistakesCount = mistakes.length;
-                lessonsToRecap = getLessonsToRecap(mistakes);
+                const found = mistakesByAttemptMap.get(attempt.id) || [];
+                mistakesCount = found.length;
+                lessonsToRecap = getLessonsToRecap(found); // lessons to review stay free
+                mistakes = mistakesUnlocked ? found : [];
             } else if (attempt.status === "in_progress") {
                 status = "waiting";
                 attemptId = attempt.id;
@@ -568,6 +621,9 @@ export const getStudentExamReports = async (req: Request, res: Response) => {
             courseName: exam.courseName,
             totalScore: exam.totalScore,
             passScore: exam.passScore,
+            duration: exam.duration,
+            numberOfQuestions: questionCounts.get(exam.id) ?? 0,
+            assigned: assignedIds.has(exam.id),
             isActive: exam.isActive,
             status,
             attemptId,
@@ -581,7 +637,8 @@ export const getStudentExamReports = async (req: Request, res: Response) => {
 
     return SuccessResponse(res, {
         message: "Exam reports retrieved successfully",
-        data: reportData
+        data: reportData,
+        mistakesUnlocked, // false → the page shows "buy mistakes" instead of the solutions
     });
 };
 
@@ -695,6 +752,11 @@ export const getStudentDiagnosticExamReports = async (req: Request, res: Respons
                 )
             );
         attendedLessonIds = new Set(studentLessonAttendance.map(a => a.lessonId));
+        const sheet = await db
+            .select({ lessonId: lessonSheet.lessonId })
+            .from(lessonSheet)
+            .where(and(eq(lessonSheet.studentId, studentId), eq(lessonSheet.status, "present"), inArray(lessonSheet.lessonId, lessonIds)));
+        sheet.forEach(r => attendedLessonIds.add(r.lessonId));
     }
 
     let allOptions: any[] = [];
@@ -736,7 +798,8 @@ export const getStudentDiagnosticExamReports = async (req: Request, res: Respons
         rightSolutionsMap.get(s.questionId)!.push({
             id: s.id,
             answerPdf: s.pdf,
-            answerVideo: s.video,
+            answerVideo: /^https?:\/\//i.test(s.video || "") ? s.video : null,
+            video: resolveSolutionVideo(s.video), // { type: "bunny", streamUrl } | { type: "external", url } | null
             answerImage: s.image,
             answerText: s.text,
         });
@@ -762,7 +825,7 @@ export const getStudentDiagnosticExamReports = async (req: Request, res: Respons
             studentGridInAnswer: m.studentGridInAnswer,
             correctOption: correctOption ? correctOption.answer : null,
             studentOption: studentOption ? studentOption.answer : null,
-            options: qOptions.map(({ questionId, isCorrect, ...rest }) => rest),
+            options: qOptions.map(({ questionId, ...rest }) => rest),
             answers: rightSolution,
             lesson: lessonDetail ? {
                 id: lessonDetail.id,

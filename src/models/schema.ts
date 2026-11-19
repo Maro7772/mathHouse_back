@@ -47,6 +47,7 @@ export * from "./schema/admin/Notes";
 export * from "./schema/admin/teacherPortal";
 export * from "./schema/admin/studentPortal";
 export * from "./schema/admin/finance";
+export * from "./schema/admin/lessonAttendance";
 
 // Drive schema
 export * from "../drive/models/drive";

@@ -11,6 +11,7 @@ import { studentSchema, updateStudentSchema, idParamsSchema, increaseLessonsDura
 import { requirePermission } from "../../middlewares/requirePermission";
 import { getStudentNotes } from "../../controllers/admin/notes";
 import { getStudentsReport } from "../../controllers/admin/reportPages";
+import { getLessonAttendance, saveLessonAttendance } from "../../controllers/admin/lessonAttendance";
 
 const router = Router();
 
@@ -26,6 +27,7 @@ router.get("/:id/open-account",    validate(idParamsSchema, "params"), requirePe
 router.get("/:id/payment-history", validate(idParamsSchema, "params"), requirePermission("students", "View"),  catchAsync(getPaymentHistory));
 router.get("/:id/content",         validate(idParamsSchema, "params"), requirePermission("students", "View"),  catchAsync(getStudentContent));
 router.get("/:id/packages",        validate(idParamsSchema, "params"), requirePermission("students", "View"),  catchAsync(getStudentPackages));
+router.get("/:id/lesson-attendance", validate(idParamsSchema, "params"), requirePermission("students", "View"), catchAsync(getLessonAttendance));
 router.get("/:id/notes", validate(idParamsSchema, "params"), requirePermission("students", "View"),  catchAsync(getStudentNotes));
 
 // ── Create ────────────────────────────────────────────────────────────────
@@ -34,6 +36,7 @@ router.post("/", validate(studentSchema), requirePermission("students", "Add"), 
 // ── Update ────────────────────────────────────────────────────────────────
 router.put("/:id",           validate(updateStudentSchema), requirePermission("students", "Edit"),  catchAsync(updateStudent));
 router.post("/:id/top-up-wallet",               validate(idParamsSchema, "params"), requirePermission("students", "Edit"), catchAsync(topUpWallet));
+router.put("/:id/lesson-attendance",  validate(idParamsSchema, "params"), requirePermission("students", "Edit"), catchAsync(saveLessonAttendance));
 router.post("/:id/enroll",                      validate(idParamsSchema, "params"), requirePermission("students", "Edit"), catchAsync(attendItems));
 router.post("/:id/packages",                    validate(idParamsSchema, "params"), requirePermission("students", "Edit"), catchAsync(purchasePackageForStudent));
 router.post("/:id/increase-lessons-duration",   validate(idParamsSchema, "params"), validate(increaseLessonsDurationSchema), requirePermission("students", "Edit"), catchAsync(increaseLessonsDuration));
