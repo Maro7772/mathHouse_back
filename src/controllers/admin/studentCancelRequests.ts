@@ -1,4 +1,6 @@
 // controllers/admin/studentCancelRequests.ts
+import { sessionHasNobody } from "../../utils/sessionVisibility";
+import { notifyTeacher } from "../teacher/portal";
 // Admin answers a student's request to cancel their seat in a session.
 import { Request, Response } from "express";
 import { and, desc, eq, sql } from "drizzle-orm";
@@ -42,7 +44,10 @@ export const listStudentCancelRequests = async (req: Request, res: Response) => 
 /**
  * PATCH /admin/student-cancel-requests/:id/respond — body { status: "accepted" | "rejected", adminReply? }
  * Accepted: the student's direct seat is removed and a live session already charged for it is refunded.
- * (A student who is in the session through a group keeps the group, but is not charged for this session.)
+ * A student in the session through a group keeps the group, but this session is gone for them
+ * (their lists, the teacher's student list and attendance skip it). If nobody is left in the session,
+ * it is cancelled so it leaves the teacher's dashboard too. The teacher is told either way.
+ * Rejected: nothing changes — the session stays on both dashboards.
  */
 export const respondToStudentCancelRequest = async (req: Request, res: Response) => {
     const { status, adminReply } = req.body as { status: "accepted" | "rejected"; adminReply?: string };
@@ -53,6 +58,7 @@ export const respondToStudentCancelRequest = async (req: Request, res: Response)
     if (request.status !== "pending") throw new BadRequest("This request was already answered");
 
     let refunded = false;
+    let sessionCancelled = false;
     await db.transaction(async (tx) => {
         await tx.update(studentCancelRequests).set({
             status, adminReply: adminReply || null, respondedByAdminId: req.user?.id ?? null, respondedAt: new Date(),
@@ -73,14 +79,33 @@ export const respondToStudentCancelRequest = async (req: Request, res: Response)
                 refunded = true;
             }
         }
+
+        // nobody left (no student, no group) → the session itself is cancelled
+        const [left] = await tx.select({ id: sessions.id }).from(sessions)
+            .where(and(eq(sessions.id, request.sessionId), eq(sessions.status, "scheduled"), sessionHasNobody(sessions.id)));
+        if (left) {
+            await tx.update(sessions).set({ status: "cancelled", cancelReason: "Cancelled — the student's cancel request was approved" })
+                .where(eq(sessions.id, request.sessionId));
+            sessionCancelled = true;
+        }
     });
 
-    const [session] = await db.select({ name: sessions.name }).from(sessions).where(eq(sessions.id, request.sessionId));
+    const [session] = await db.select({ name: sessions.name, teacherId: sessions.teacherId, date: sessions.sessionDate, timeFrom: sessions.timeFrom })
+        .from(sessions).where(eq(sessions.id, request.sessionId));
     await sendStudentNotification(
         request.studentId,
         `Your request to cancel "${session?.name ?? "the session"}" was ${status}.${adminReply ? ` Admin: ${adminReply}` : ""}`,
     );
+    if (status === "accepted" && session?.teacherId) {
+        const [st] = await db.select({ first: Student.firstname, last: Student.lastname }).from(Student).where(eq(Student.id, request.studentId));
+        const when = `${String(session.date ?? "").slice(0, 10)} ${String(session.timeFrom ?? "").slice(0, 5)}`.trim();
+        try {
+            await notifyTeacher(session.teacherId, sessionCancelled
+                ? `"${session.name}" (${when}) was cancelled — the student cancelled and nobody else is booked.`
+                : `${[st?.first, st?.last].filter(Boolean).join(" ") || "A student"} will not attend "${session.name}" (${when}) — their cancel request was approved.`);
+        } catch (e) { console.error("Failed to notify teacher", e); }
+    }
 
     const [updated] = await selectRequests().where(eq(studentCancelRequests.id, request.id));
-    return SuccessResponse(res, { message: `Request ${status}`, refunded, request: updated });
+    return SuccessResponse(res, { message: `Request ${status}`, refunded, sessionCancelled, request: updated });
 };

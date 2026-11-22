@@ -17,6 +17,7 @@ import { eq, and, or, desc, sql, inArray, like, gte } from "drizzle-orm";
 import { SuccessResponse } from "../../utils/response";
 import { BadRequest, NotFound } from "../../Errors";
 import { sendStudentNotification } from "../../utils/studentNotification";
+import { matchGroupSessions } from "../../utils/groupMatching";
 
 // ── 1. Get All Availability Plans (Admin) ───────────────────────────────────
 export const getAllAvailabilityPlans = async (req: Request, res: Response) => {
@@ -261,7 +262,7 @@ export const getMatchingSessionsForPlan = async (req: Request, res: Response) =>
     const todayStr = new Date().toISOString().split("T")[0];
 
     // ── Fetch upcoming sessions ───────────────────────────────────────────────
-    const upcomingSessions = await db
+    let upcomingSessions = await db
         .select({
             id: sessions.id,
             name: sessions.name,
@@ -284,7 +285,13 @@ export const getMatchingSessionsForPlan = async (req: Request, res: Response) =>
             )
         )
         .orderBy(sessions.sessionDate, sessions.timeFrom)
-        .limit(200);
+        .limit(500);
+
+    // Phase F: only group sessions the student can really join (scheduled, fully inside a free time,
+    // a course they bought, lessons they still need, no clash, not already theirs) — same rules as the planner.
+    const { matches } = await matchGroupSessions(id, { to: "2999-12-31" });
+    const fit = new Map(matches.map((m) => [m.id, m]));
+    upcomingSessions = upcomingSessions.filter((s) => fit.has(s.id));
 
     if (upcomingSessions.length === 0) {
         return SuccessResponse(res, { planSlots: slots, candidateSessions: [] });
@@ -398,6 +405,9 @@ export const getMatchingSessionsForPlan = async (req: Request, res: Response) =>
             lessons: lessonsMap[session.id] ?? [],
             // ── Whether this student is already enrolled ──────────────────────
             studentAlreadyEnrolled: enrolledSessionIds.has(session.id),
+            groups: fit.get(session.id)?.groups ?? [],
+            lessonStatus: fit.get(session.id)?.lessons ?? [],
+            neededLessons: fit.get(session.id)?.needed ?? 0,
         });
     }
 
@@ -456,15 +466,20 @@ export const proposeSessionsForPlan = async (req: Request, res: Response) => {
         }
     }
 
-    // Replace current proposed sessions
-    await db.delete(studentPlanSessions).where(eq(studentPlanSessions.planId, id));
+    // Replace the proposal, but keep what the student already accepted (and don't propose those again)
+    const keptRows = await db.select({ sessionId: studentPlanSessions.sessionId }).from(studentPlanSessions)
+        .where(and(eq(studentPlanSessions.planId, id), eq(studentPlanSessions.studentResponse, "accepted")));
+    const keptIds = new Set(keptRows.map((k) => k.sessionId));
+    await db.delete(studentPlanSessions).where(and(eq(studentPlanSessions.planId, id), sql`${studentPlanSessions.studentResponse} <> 'accepted'`));
+    const newSessionIds = uniqueSessionIds.filter((sId) => !keptIds.has(sId));
+    if (newSessionIds.length === 0) throw new BadRequest("All selected sessions were already accepted by the student");
 
-    const planSessionInserts = uniqueSessionIds.map((sessionId, idx) => ({
+    const planSessionInserts = newSessionIds.map((sessionId, idx) => ({
         id: randomUUID(),
         planId: id,
         sessionId,
         notes: notesMap[sessionId] || null,
-        orderIndex: idx + 1,
+        orderIndex: keptIds.size + idx + 1,
     }));
 
     await db.insert(studentPlanSessions).values(planSessionInserts);

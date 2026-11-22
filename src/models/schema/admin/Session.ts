@@ -26,6 +26,8 @@ export const sessions = mysqlTable("sessions", {
     session_link:          varchar("session_link",          { length: 500 }),
     material_link:         varchar("material_link",         { length: 500 }),
     teacher_material_link: varchar("teacher_material_link", { length: 500 }),
+    // the class recording (Google Drive link) the teacher adds after the session — students who attended see it
+    recordingLink:         varchar("recording_link",        { length: 500 }),
 
     sessionRelationalType: mysqlEnum("session_relational_type", ["Explanation", "Re-Explanation", "Mistakes", "Exam"]).default("Explanation"),
 

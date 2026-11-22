@@ -19,6 +19,10 @@ import { SuccessResponse } from "../../utils/response";
 import { BadRequest, NotFound } from "../../Errors";
 import { sendStudentNotification } from "../../utils/studentNotification";
 import { notifyTeacher } from "../teacher/portal";
+import { sessionHasNobody } from "../../utils/sessionVisibility";
+import { assertTeacherFree } from "../../utils/teacherSchedule";
+import { studentSessionBudget, studentLessonStatus } from "../../utils/studentPlanning";
+import { matchGroupSessions } from "../../utils/groupMatching";
 
 type Row = Record<string, any>;
 const rows = async (q: SQL): Promise<Row[]> => {
@@ -48,7 +52,10 @@ async function bookingsAt(date: string, timeFrom: string, timeTo: string, skipId
     const skip = skipIds.length ? sql`AND s.id NOT IN (${sql.join(skipIds.map((id) => sql`${id}`), sql`, `)})` : sql``;
     const overlap = sql`s.status = 'scheduled' AND s.session_date = ${date}
         AND s.time_from < ${hhmmss(timeTo)} AND s.time_to > ${hhmmss(timeFrom)} ${skip}`;
-    const teacherRows = await rows(sql`SELECT DISTINCT s.teacher_id AS id, s.name FROM sessions s WHERE ${overlap}`);
+    const teacherRows = await rows(sql`SELECT DISTINCT s.teacher_id AS id, s.name FROM sessions s WHERE ${overlap}
+        AND NOT (${sessionHasNobody(sql`s.id`)}
+                 AND EXISTS (SELECT 1 FROM student_plan_sessions px WHERE px.session_id = s.id)
+                 AND NOT EXISTS (SELECT 1 FROM student_plan_sessions px WHERE px.session_id = s.id AND px.student_response = 'pending'))`);
     const studentRows = await rows(sql`
         SELECT su.student_id AS id FROM session_users su JOIN sessions s ON s.id = su.session_id WHERE ${overlap}
         UNION
@@ -227,6 +234,8 @@ async function prepareItem(item: Item, courseId: string, taken: Item[], skipIds:
     }
     const clash = taken.find((x) => x.teacherId === item.teacherId && x.date === item.date && toMin(x.timeFrom) < toMin(item.timeTo) && toMin(x.timeTo) > toMin(item.timeFrom));
     if (clash) throw new BadRequest(`Two sessions with ${teacher.name} overlap on ${pretty(item.date, item.timeFrom)}`);
+    // inside the teacher's working hours (it used to be only a warning)
+    await assertTeacherFree(teacher.id, [{ date: item.date, from: item.timeFrom, to: item.timeTo }], skipIds);
 
     return {
         teacher,
@@ -281,32 +290,116 @@ async function replaceableSessions(planId: string): Promise<string[]> {
     return list.map((r) => r.id as string);
 }
 
-// POST /admin/planner/plans/:planId/build — create sessions in the student's free times and propose them
+// GET /admin/planner/plans/:planId/budget — how many sessions this student can still be planned
+export const getPlanBudget = async (req: Request, res: Response) => {
+    const [plan] = await db.select({ studentId: studentAvailabilityPlans.studentId }).from(studentAvailabilityPlans).where(eq(studentAvailabilityPlans.id, String(req.params.planId)));
+    if (!plan) throw new NotFound("Study plan not found");
+    return SuccessResponse(res, await studentSessionBudget(plan.studentId, String(req.params.planId)));
+};
+
+// GET /admin/planner/plans/:planId/group-sessions[?from&to] — existing group sessions this student can join:
+// inside their free times, in a course they bought, teaching lessons they still need, no clash with their sessions.
+export const getPlanGroupSessions = async (req: Request, res: Response) => {
+    const planId = String(req.params.planId);
+    const [plan] = await db.select({ id: studentAvailabilityPlans.id }).from(studentAvailabilityPlans).where(eq(studentAvailabilityPlans.id, planId));
+    if (!plan) throw new NotFound("Study plan not found");
+    const from = ISO.test(String(req.query.from || "")) ? String(req.query.from) : undefined;
+    const to = ISO.test(String(req.query.to || "")) ? String(req.query.to) : undefined;
+    const { matches } = await matchGroupSessions(planId, { from, to });
+    return SuccessResponse(res, { sessions: matches });
+};
+
+// POST /admin/planner/plans/:planId/build — create sessions in the student's free times and/or add existing
+// group sessions (Phase F), and propose them all together; the student accepts/declines each one.
 export const buildPlan = async (req: Request, res: Response) => {
     const planId = String(req.params.planId);
-    const { courseId, adminNotes, items } = req.body as { courseId: string; adminNotes?: string; items: Item[] };
+    const { courseId, adminNotes } = req.body as { courseId?: string; adminNotes?: string };
+    const items: Item[] = Array.isArray(req.body.items) ? req.body.items : [];
+    const groupSessionIds: string[] = [...new Set<string>(Array.isArray(req.body.groupSessionIds) ? req.body.groupSessionIds : [])];
     const [plan] = await db.select().from(studentAvailabilityPlans).where(eq(studentAvailabilityPlans.id, planId));
     if (!plan) throw new NotFound("Study plan not found");
     if (plan.status === "cancelled" || plan.status === "accepted") throw new BadRequest(`This plan is ${plan.status} — it can't get a new proposal`);
-    const [course] = await db.select({ id: courses.id }).from(courses).where(eq(courses.id, courseId));
-    if (!course) throw new BadRequest("Course not found");
+    if (items.length + groupSessionIds.length === 0) throw new BadRequest("Add at least one session");
+    // sessions the student already accepted in this plan are kept; new ones are added after them
+    const [{ kept }] = await rows(sql`SELECT COUNT(*) AS kept FROM student_plan_sessions WHERE plan_id = ${planId} AND student_response = 'accepted'`);
+    if (items.length) {
+        const [course] = await db.select({ id: courses.id }).from(courses).where(eq(courses.id, String(courseId || "")));
+        if (!course) throw new BadRequest(courseId ? "Course not found" : "Pick a course");
+    }
 
     // Sessions only proposed by an earlier version of this plan are replaced, so they don't count as clashes.
     const earlier = await replaceableSessions(planId);
+    // every answer of this plan that isn't "accepted" is being replaced (new sessions and group sessions alike)
+    const replacing = (await rows(sql`SELECT session_id AS id FROM student_plan_sessions WHERE plan_id = ${planId} AND student_response <> 'accepted'`)).map((r) => r.id as string);
+
+    // group sessions must still match: scheduled, in their free times, lessons they need, no clash
+    const groupPicks: Row[] = [];
+    if (groupSessionIds.length) {
+        const { matches } = await matchGroupSessions(planId, { to: "2999-12-31" });
+        for (const id of groupSessionIds) {
+            const m = matches.find((x) => x.id === id);
+            if (!m) {
+                const [s] = await rows(sql`SELECT name FROM sessions WHERE id = ${id}`);
+                throw new BadRequest(`"${s?.name || "A group session"}" no longer fits this student (time, course, lessons they need, or a clash) — refresh the list.`);
+            }
+            if (m.inThisPlan === "accepted") throw new BadRequest(`"${m.name}" is already accepted in this plan`);
+            groupPicks.push(m);
+        }
+        for (let i = 0; i < groupPicks.length; i++) for (let j = i + 1; j < groupPicks.length; j++) {
+            const a = groupPicks[i], b = groupPicks[j];
+            if (a.date === b.date && toMin(a.timeFrom) < toMin(b.timeTo) && toMin(a.timeTo) > toMin(b.timeFrom)) throw new BadRequest(`"${a.name}" and "${b.name}" overlap — the student can join only one`);
+        }
+        for (const it of items) {
+            const g = groupPicks.find((x) => x.date === it.date && toMin(x.timeFrom) < toMin(it.timeTo) && toMin(x.timeTo) > toMin(it.timeFrom));
+            if (g) throw new BadRequest(`The new session on ${pretty(it.date, it.timeFrom)} overlaps the group session "${g.name}"`);
+        }
+    }
+    const total = items.length + groupPicks.length;
+
+    // the plan matches what the student bought: never more sessions than they have left
+    const budget = await studentSessionBudget(plan.studentId, planId);
+    if (total > budget.toPlan) {
+        throw new BadRequest(budget.toPlan === 0
+            ? `This student has no live sessions left to plan (balance ${budget.liveBalance}, ${budget.booked} already booked${budget.waiting ? `, ${budget.waiting} waiting in another plan` : ""}). Add a package first.`
+            : `This student has only ${budget.toPlan} session${budget.toPlan === 1 ? "" : "s"} left to plan (balance ${budget.liveBalance}, ${budget.booked} already booked${budget.waiting ? `, ${budget.waiting} waiting in another plan` : ""}) — remove ${total - budget.toPlan}.`);
+    }
+
+    // returning students: an Explanation never re-teaches a lesson already attended or booked
+    // (Re-Explanation / Mistakes sessions are meant to revisit lessons, so they are allowed)
+    const lessonStatus = await studentLessonStatus(plan.studentId, replacing);
+    const seen = new Set<string>();
+    // lessons the chosen group sessions will teach count as planned
+    groupPicks.forEach((g) => { if (g.type === "Explanation") g.lessons.forEach((l: Row) => seen.add(l.id)); });
+    const nameOf = async (id: string) => (await db.select({ name: lessons.name }).from(lessons).where(eq(lessons.id, id)))[0]?.name || "A lesson";
+    for (const it of items) {
+        if (it.type !== "Explanation") continue;
+        for (const lessonId of it.lessonIds || []) {
+            const st = lessonStatus.get(lessonId);
+            if (st) throw new BadRequest(`"${await nameOf(lessonId)}" is already ${st === "attended" ? "attended" : "booked"} by this student — pick another lesson, or use a Re-Explanation session.`);
+            if (seen.has(lessonId)) throw new BadRequest(`"${await nameOf(lessonId)}" is in this plan twice${groupPicks.some((g) => g.lessons.some((l: Row) => l.id === lessonId)) ? " (a chosen group session teaches it)" : ""}.`);
+            seen.add(lessonId);
+        }
+    }
     const prepared: { row: any; item: Item }[] = [];
     for (const item of items) {
-        const p = await prepareItem(item, courseId, prepared.map((x) => x.item), earlier);
+        const p = await prepareItem(item, String(courseId), prepared.map((x) => x.item), earlier);
         prepared.push({ row: p.row, item });
     }
 
     await db.transaction(async (tx) => {
-        await tx.delete(studentPlanSessions).where(eq(studentPlanSessions.planId, planId));
+        // only the answers that are not "accepted" are replaced (declined + still waiting)
+        await tx.delete(studentPlanSessions).where(and(eq(studentPlanSessions.planId, planId), sql`${studentPlanSessions.studentResponse} <> 'accepted'`));
         if (earlier.length) await tx.delete(sessions).where(inArray(sessions.id, earlier));
-        await tx.insert(sessions).values(prepared.map((p) => p.row));
+        if (prepared.length) await tx.insert(sessions).values(prepared.map((p) => p.row));
         const lessonRows = prepared.flatMap((p) => p.item.lessonIds.map((lessonId) => ({ id: randomUUID(), sessionId: p.row.id, lessonId })));
         if (lessonRows.length) await tx.insert(sessionLessons).values(lessonRows);
         // The student joins each session when they accept it (existing study-plan flow).
-        await tx.insert(studentPlanSessions).values(prepared.map((p, i) => ({ id: randomUUID(), planId, sessionId: p.row.id, orderIndex: i + 1 })));
+        // new sessions and group sessions, in date order
+        const all = [
+            ...prepared.map((p) => ({ sessionId: p.row.id as string, at: `${p.item.date} ${hhmmss(p.item.timeFrom)}`, notes: null as string | null })),
+            ...groupPicks.map((g) => ({ sessionId: g.id as string, at: `${g.date} ${hhmmss(g.timeFrom)}`, notes: `Group session — ${g.groups.map((x: Row) => x.name).join(", ")}` })),
+        ].sort((a, b) => a.at.localeCompare(b.at));
+        await tx.insert(studentPlanSessions).values(all.map((x, i) => ({ id: randomUUID(), planId, sessionId: x.sessionId, notes: x.notes, orderIndex: Number(kept) + i + 1 })));
         await tx.update(studentAvailabilityPlans).set({
             status: "plan_proposed",
             adminNotes: adminNotes !== undefined ? adminNotes : plan.adminNotes,
@@ -315,9 +408,11 @@ export const buildPlan = async (req: Request, res: Response) => {
         }).where(eq(studentAvailabilityPlans.id, planId));
     });
 
-    await sendStudentNotification(plan.studentId,
-        `Your study plan "${plan.title}" is ready: ${prepared.length} session${prepared.length === 1 ? "" : "s"} in your free times. Please review and accept them.`);
-    return SuccessResponse(res, { message: "Plan sent to the student", planId, sessionIds: prepared.map((p) => p.row.id), removedEarlier: earlier.length }, 201);
+    const groupNote = groupPicks.length ? ` (${groupPicks.length} with a group)` : "";
+    await sendStudentNotification(plan.studentId, Number(kept)
+        ? `New times for your study plan "${plan.title}": ${total} session${total === 1 ? "" : "s"}${groupNote} to review (the ${kept} you accepted stay booked).`
+        : `Your study plan "${plan.title}" is ready: ${total} session${total === 1 ? "" : "s"}${groupNote} in your free times. Please review and accept them.`);
+    return SuccessResponse(res, { message: "Plan sent to the student", planId, sessionIds: prepared.map((p) => p.row.id), groupSessionIds: groupPicks.map((g) => g.id), removedEarlier: earlier.length }, 201);
 };
 
 // POST /admin/planner/sessions/:id/approve — accept a proposed plan session on the student's behalf
@@ -326,8 +421,8 @@ export const approvePlanSession = async (req: Request, res: Response) => {
     const links = await rows(sql`
         SELECT ps.id, ps.plan_id AS planId, p.student_id AS studentId, p.title
         FROM student_plan_sessions ps JOIN student_availability_plans p ON p.id = ps.plan_id
-        WHERE ps.session_id = ${sessionId} AND ps.student_response <> 'accepted' AND p.status <> 'cancelled'`);
-    if (!links.length) throw new BadRequest("This session is not waiting for a student's answer");
+        WHERE ps.session_id = ${sessionId} AND ps.student_response = 'pending' AND p.status <> 'cancelled'`);
+    if (!links.length) throw new BadRequest("This session is not waiting for a student's answer (a declined session is rescheduled by rebuilding the plan)");
     const [session] = await db.select({ name: sessions.name, date: sessions.sessionDate, timeFrom: sessions.timeFrom }).from(sessions).where(eq(sessions.id, sessionId));
 
     await db.transaction(async (tx) => {
@@ -340,9 +435,9 @@ export const approvePlanSession = async (req: Request, res: Response) => {
     });
     // A plan whose sessions are all answered and at least one accepted counts as accepted.
     for (const planId of new Set(links.map((l) => l.planId as string))) {
-        const [left] = await rows(sql`SELECT SUM(student_response = 'pending') AS pending, SUM(student_response = 'accepted') AS accepted
-            FROM student_plan_sessions WHERE plan_id = ${planId}`);
-        if (Number(left?.pending) === 0 && Number(left?.accepted) > 0) {
+        const [left] = await rows(sql`SELECT SUM(student_response = 'pending') AS pending, SUM(student_response = 'accepted') AS accepted,
+            SUM(student_response = 'rejected') AS rejected FROM student_plan_sessions WHERE plan_id = ${planId}`);
+        if (Number(left?.pending) === 0 && Number(left?.rejected) === 0 && Number(left?.accepted) > 0) {
             await db.update(studentAvailabilityPlans).set({ status: "accepted", respondedAt: new Date() }).where(eq(studentAvailabilityPlans.id, planId));
         }
     }
@@ -415,16 +510,21 @@ export const getPlannerOptions = async (req: Request, res: Response) => {
 // GET /admin/planner/courses/:courseId/lessons — chapters with their lessons, in course order
 export const getCourseLessons = async (req: Request, res: Response) => {
     const courseId = String(req.params.courseId);
+    // ?studentId: mark lessons this student already attended or has booked (returning students)
+    const studentId = req.query.studentId ? String(req.query.studentId) : "";
+    const lessonStatus = studentId
+        ? await studentLessonStatus(studentId, req.query.planId ? await replaceableSessions(String(req.query.planId)) : [])
+        : new Map<string, string>();
     const list = await rows(sql`
         SELECT ch.id AS chapterId, ch.name AS chapterName, l.id, l.name
         FROM chapters ch JOIN lessons l ON l.chapter_id = ch.id
         WHERE ch.course_id = ${courseId}
         ORDER BY COALESCE(ch.\`order\`, 9999), ch.created_at, COALESCE(l.\`order\`, 9999), l.created_at`);
-    const chapters: { id: string; name: string; lessons: { id: string; name: string }[] }[] = [];
+    const chapters: { id: string; name: string; lessons: { id: string; name: string; status?: string | null }[] }[] = [];
     list.forEach((r) => {
         let ch = chapters[chapters.length - 1];
         if (!ch || ch.id !== r.chapterId) { ch = { id: r.chapterId, name: r.chapterName, lessons: [] }; chapters.push(ch); }
-        ch.lessons.push({ id: r.id, name: r.name });
+        ch.lessons.push({ id: r.id, name: r.name, ...(studentId ? { status: lessonStatus.get(r.id) || null } : {}) });
     });
     return SuccessResponse(res, { chapters });
 };

@@ -55,6 +55,7 @@ const resolveAndPrepareSlots = async (planId: string, slotIds?: string[], slots?
     } else if (Array.isArray(slots) && slots.length > 0) {
         // Option 2: Array of slot objects (each may specify slotId and/or specificDate / custom times)
         const refIds = slots.filter((s: any) => s.slotId).map((s: any) => s.slotId);
+        const activeAdminSlots = await db.select().from(adminAvailabilitySlots).where(eq(adminAvailabilitySlots.isActive, true));
         let adminSlotsMap: Record<string, any> = {};
 
         if (refIds.length > 0) {
@@ -90,14 +91,21 @@ const resolveAndPrepareSlots = async (planId: string, slotIds?: string[], slots?
                     timeTo: adminSlot.timeTo,
                 });
             } else {
+                // Only the admin's time slots can be chosen: a day + time that matches an active admin slot
+                // is linked to it; any other (custom) time is refused.
+                const hms = (t: any) => { const [h, m] = String(t || "").split(":"); return `${String(h).padStart(2, "0")}:${String(m || "00").padStart(2, "0")}`; };
+                const match = activeAdminSlots.find((as) => as.dayOfWeek === s.dayOfWeek && hms(as.timeFrom) === hms(s.timeFrom) && hms(as.timeTo) === hms(s.timeTo));
+                if (!match) {
+                    throw new BadRequest(`${s.dayOfWeek || "That day"} ${hms(s.timeFrom)}–${hms(s.timeTo)} is not one of the available time slots. Pick from the times offered.`);
+                }
                 slotInserts.push({
                     id: randomUUID(),
                     planId,
-                    adminSlotId: null,
-                    dayOfWeek: s.dayOfWeek || null,
+                    adminSlotId: match.id,
+                    dayOfWeek: match.dayOfWeek,
                     specificDate: s.specificDate ? s.specificDate : null,
-                    timeFrom: s.timeFrom,
-                    timeTo: s.timeTo,
+                    timeFrom: match.timeFrom,
+                    timeTo: match.timeTo,
                 });
             }
         }
@@ -372,154 +380,80 @@ export const getMyAvailabilityPlanById = async (req: Request, res: Response) => 
     });
 };
 
-// ── 4. Respond to Proposed Plan (Accept / Reject) ───────────────────────────
+// ── 4. Respond to Proposed Plan (per session) ───────────────────────────────
+// POST /user/availability-plans/:id/respond
+//   { action: "accept", rejectedSessionIds?: string[], feedback? }  → accept every waiting session except the rejected ones
+//   { action: "reject", feedback? }                                   → decline every waiting session
+// Accepted sessions: the student joins them (Upcoming + the teacher's dashboard).
+// Declined sessions: hidden from everyone; the plan goes back to the admin to reschedule them
+// (sessions accepted earlier stay accepted). With nothing declined, the plan is accepted.
 export const respondToProposedPlan = async (req: Request, res: Response) => {
     const studentId = getStudentId(req);
     const { id } = req.params;
-    const { action, feedback } = req.body;
+    const { action, feedback } = req.body as { action: "accept" | "reject"; feedback?: string };
+    const rejectedSessionIds: string[] = Array.isArray(req.body?.rejectedSessionIds) ? req.body.rejectedSessionIds : [];
 
     const [plan] = await db
         .select()
         .from(studentAvailabilityPlans)
-        .where(
-            and(
-                eq(studentAvailabilityPlans.id, id),
-                eq(studentAvailabilityPlans.studentId, studentId)
-            )
-        )
+        .where(and(eq(studentAvailabilityPlans.id, id), eq(studentAvailabilityPlans.studentId, studentId)))
         .limit(1);
+    if (!plan) throw new NotFound("Availability plan not found");
+    if (plan.status === "cancelled") throw new BadRequest("This plan was cancelled and cannot be responded to.");
+    if (plan.status === "pending_admin_review") throw new BadRequest("The admin is still preparing sessions for this plan.");
 
-    if (!plan) {
-        throw new NotFound("Availability plan not found");
+    // only the sessions still waiting for an answer can be answered
+    const waiting = await db
+        .select({ id: studentPlanSessions.id, sessionId: studentPlanSessions.sessionId })
+        .from(studentPlanSessions)
+        .where(and(eq(studentPlanSessions.planId, id), eq(studentPlanSessions.studentResponse, "pending")));
+    if (waiting.length === 0) throw new BadRequest("There are no sessions waiting for your answer in this plan.");
+
+    const waitingIds = new Set(waiting.map((w) => w.sessionId));
+    const declineSet = new Set<string>(action === "reject" ? [...waitingIds] : rejectedSessionIds);
+    for (const sId of declineSet) {
+        if (!waitingIds.has(sId)) throw new BadRequest("One of the sessions you declined is not waiting for an answer in this plan.");
     }
+    const accepted = waiting.filter((w) => !declineSet.has(w.sessionId));
+    const declined = waiting.filter((w) => declineSet.has(w.sessionId));
 
-    if (plan.status === "pending_admin_review") {
-        throw new BadRequest("The admin has not yet proposed sessions for this plan.");
-    }
-
-    if (plan.status === "accepted") {
-        throw new BadRequest("This plan has already been accepted.");
-    }
-
-    if (plan.status === "cancelled") {
-        throw new BadRequest("This plan was cancelled and cannot be responded to.");
-    }
-
-    if (action === "accept") {
-        // Fetch all sessions proposed for this plan (with their plan-session row id)
-        const assignedSessions = await db
-            .select({ id: studentPlanSessions.id, sessionId: studentPlanSessions.sessionId })
-            .from(studentPlanSessions)
-            .where(eq(studentPlanSessions.planId, id));
-
-        if (assignedSessions.length === 0) {
-            throw new BadRequest("Cannot accept a plan with no proposed sessions.");
+    await db.transaction(async (tx) => {
+        for (const w of waiting) {
+            await tx.update(studentPlanSessions)
+                .set({ studentResponse: declineSet.has(w.sessionId) ? "rejected" : "accepted" })
+                .where(eq(studentPlanSessions.id, w.id));
         }
-
-        // Student may optionally pass session IDs they want to reject (partial acceptance)
-        const { rejectedSessionIds = [] } = req.body as { rejectedSessionIds?: string[] };
-        const rejectedSet = new Set<string>(rejectedSessionIds);
-
-        // Validate: all rejected IDs must actually belong to this plan
-        const planSessionIds = new Set(assignedSessions.map((s) => s.sessionId));
-        for (const rId of rejectedSet) {
-            if (!planSessionIds.has(rId)) {
-                throw new BadRequest(`Session "${rId}" is not part of this plan.`);
-            }
+        if (accepted.length) {
+            const acceptedIds = accepted.map((a) => a.sessionId);
+            const already = await tx.select({ sessionId: sessionUsers.sessionId }).from(sessionUsers)
+                .where(and(eq(sessionUsers.studentId, studentId), inArray(sessionUsers.sessionId, acceptedIds)));
+            const have = new Set(already.map((e) => e.sessionId));
+            const add = acceptedIds.filter((sId) => !have.has(sId)).map((sessionId) => ({ id: randomUUID(), sessionId, studentId }));
+            if (add.length) await tx.insert(sessionUsers).values(add);
         }
+        await tx.update(studentAvailabilityPlans).set({
+            // anything declined → back to the admin to reschedule; otherwise the plan is fully accepted
+            status: declined.length ? "pending_admin_review" : "accepted",
+            studentFeedback: feedback?.trim() ? feedback.trim() : plan.studentFeedback,
+            respondedAt: new Date(),
+        }).where(eq(studentAvailabilityPlans.id, id));
+    });
 
-        // Student must keep at least one session — cannot reject all
-        const acceptedSessions = assignedSessions.filter((s) => !rejectedSet.has(s.sessionId));
-        if (acceptedSessions.length === 0) {
-            throw new BadRequest(
-                "You must accept at least one session. To decline the entire plan use action 'reject'."
-            );
-        }
+    await sendStudentNotification(
+        studentId,
+        declined.length
+            ? `You accepted ${accepted.length} and declined ${declined.length} session(s) of "${plan.title}". The admin will offer new times for the declined ones.`
+            : `You accepted all ${accepted.length} session(s) of "${plan.title}". They are now in your upcoming sessions.`
+    );
 
-        // ── Mark each plan-session row with the student's per-session response ──
-        for (const ps of assignedSessions) {
-            await db
-                .update(studentPlanSessions)
-                .set({ studentResponse: rejectedSet.has(ps.sessionId) ? "rejected" : "accepted" })
-                .where(eq(studentPlanSessions.id, ps.id));
-        }
-
-        // ── Enroll student only in accepted sessions ──────────────────────────
-        const acceptedSessionIds = acceptedSessions.map((s) => s.sessionId);
-
-        const existingEnrollments = await db
-            .select({ sessionId: sessionUsers.sessionId })
-            .from(sessionUsers)
-            .where(
-                and(
-                    eq(sessionUsers.studentId, studentId),
-                    inArray(sessionUsers.sessionId, acceptedSessionIds)
-                )
-            );
-
-        const enrolledSet = new Set(existingEnrollments.map((e) => e.sessionId));
-        const newEnrollments = acceptedSessionIds
-            .filter((sId) => !enrolledSet.has(sId))
-            .map((sId) => ({
-                id: randomUUID(),
-                sessionId: sId,
-                studentId,
-            }));
-
-        if (newEnrollments.length > 0) {
-            await db.insert(sessionUsers).values(newEnrollments);
-        }
-
-        // ── Mark the plan itself as accepted ──────────────────────────────────
-        await db
-            .update(studentAvailabilityPlans)
-            .set({
-                status: "accepted",
-                studentFeedback: feedback || null,
-                respondedAt: new Date(),
-            })
-            .where(eq(studentAvailabilityPlans.id, id));
-
-        const rejectedCount = rejectedSet.size;
-        const acceptedCount  = acceptedSessions.length;
-
-        await sendStudentNotification(
-            studentId,
-            `You have accepted the study plan "${plan.title}" with ${acceptedCount} session(s)` +
-            (rejectedCount > 0 ? ` and rejected ${rejectedCount} session(s).` : ".")
-        );
-
-        return SuccessResponse(res, {
-            message: `Plan accepted. Enrolled in ${acceptedCount} session(s)${rejectedCount > 0 ? `, ${rejectedCount} session(s) skipped.` : "."}`,
-            acceptedCount,
-            rejectedCount,
-            newlyEnrolledCount: newEnrollments.length,
-            status: "accepted",
-        });
-    }
-
-    if (action === "reject") {
-        await db
-            .update(studentAvailabilityPlans)
-            .set({
-                status: "rejected",
-                studentFeedback: feedback || null,
-                respondedAt: new Date(),
-            })
-            .where(eq(studentAvailabilityPlans.id, id));
-
-        await sendStudentNotification(
-            studentId,
-            `You have rejected the proposed schedule for "${plan.title}". The admin will review your feedback and propose alternative sessions.`
-        );
-
-        return SuccessResponse(res, {
-            message: "Plan rejected. Your feedback has been recorded for admin review.",
-            status: "rejected",
-        });
-    }
-
-    throw new BadRequest("Invalid action. Must be 'accept' or 'reject'.");
+    return SuccessResponse(res, {
+        message: declined.length
+            ? `${accepted.length} accepted, ${declined.length} declined — the admin will reschedule the declined ones.`
+            : `All ${accepted.length} session(s) accepted.`,
+        acceptedCount: accepted.length,
+        rejectedCount: declined.length,
+        status: declined.length ? "pending_admin_review" : "accepted",
+    });
 };
 
 // ── 5. Cancel Plan (Only if pending admin review) ───────────────────────────

@@ -154,17 +154,23 @@ export async function markStudentPresent(
     let lessonsUnlocked = 0;
     if (sessionLessonIds.length > 0) {
         const alreadyEnrolled = await tx
-            .select({ lessonId: enrolledItems.lessonId })
+            .select({ id: enrolledItems.id, lessonId: enrolledItems.lessonId, expiresAt: enrolledItems.expiresAt })
             .from(enrolledItems)
             .where(and(
                 eq(enrolledItems.studentId, studentId),
                 eq(enrolledItems.status, "active"),
                 inArray(enrolledItems.lessonId, sessionLessonIds)
             ));
-        const enrolledLessonIdSet = new Set(alreadyEnrolled.map(r => r.lessonId).filter(Boolean));
         const expiresAt = session.contentAccessDays
             ? new Date(Date.now() + session.contentAccessDays * 24 * 60 * 60 * 1000)
             : null;
+        // attending again renews access that already ran out (it used to stay expired)
+        const now = Date.now();
+        const stale = alreadyEnrolled.filter(r => r.expiresAt && new Date(r.expiresAt).getTime() <= now);
+        for (const r of stale) {
+            await tx.update(enrolledItems).set({ expiresAt }).where(eq(enrolledItems.id, r.id));
+        }
+        const enrolledLessonIdSet = new Set(alreadyEnrolled.map(r => r.lessonId).filter(Boolean));
         const newEnrollments = sessionLessonIds
             .filter(id => !enrolledLessonIdSet.has(id))
             .map(lessonId => ({ id: randomUUID(), studentId, lessonId, status: "active" as const, expiresAt }));

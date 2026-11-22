@@ -21,11 +21,14 @@ export const plannerCreateSessionSchema = plannerItemSchema.extend({
     groupIds: z.array(z.string().min(1)).max(20).default([]),
 });
 
+// new individual sessions (items, need a course) and/or existing group sessions to join (Phase F)
 export const plannerBuildPlanSchema = z.object({
-    courseId: z.string().min(1, "Pick a course"),
+    courseId: z.string().optional(),
     adminNotes: z.string().trim().max(1000).optional(),
-    items: z.array(plannerItemSchema).min(1, "Add at least one session").max(60),
-});
+    items: z.array(plannerItemSchema).max(60).default([]),
+    groupSessionIds: z.array(z.string().min(1)).max(60).default([]),
+}).refine((b) => b.items.length + b.groupSessionIds.length > 0, { message: "Add at least one session", path: ["items"] })
+  .refine((b) => !b.items.length || !!b.courseId, { message: "Pick a course", path: ["courseId"] });
 
 export const plannerDispatchSchema = z.object({
     sessionIds: z.array(z.string().min(1)).min(1, "Pick at least one session").max(300),

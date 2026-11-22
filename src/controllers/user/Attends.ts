@@ -1,4 +1,6 @@
 import { Request, Response } from "express";
+import { notCancelledByStudent } from "../../utils/sessionVisibility";
+import { studentCancelRequests } from "../../models/schema/admin/studentPortal";
 import { randomUUID } from "crypto";
 import { db } from "../../models/connection";
 import { sessionLessons, sessions, sessionUsers, sessionGroups, sessionStudentPdfs, sessionPackageDeductions } from "../../models/schema/admin/Session";
@@ -73,8 +75,32 @@ const resolveIdea = (idea: {
     return { ...rest, video: videoPayload };
 };
 
+/**
+ * Lessons whose access has run out for this student: they have enrollments for the lesson (directly, or
+ * via its chapter / course) and every one of them is expired. A student with no enrollment record at all
+ * (older data) is not blocked here.
+ */
+async function expiredLessonIds(studentId: string, lessonIds: string[]): Promise<Set<string>> {
+    if (!lessonIds.length) return new Set();
+    const inIds = sql.join([...new Set(lessonIds)].map((id) => sql`${id}`), sql`, `);
+    const match = sql`e.studentId = ${studentId} AND (e.lessonId = l.id OR (e.lessonId IS NULL AND e.chapterId = l.chapter_id)
+        OR (e.lessonId IS NULL AND e.chapterId IS NULL AND e.courseId = l.course_id))`;
+    const res: any = await db.execute(sql`
+        SELECT l.id FROM lessons l WHERE l.id IN (${inIds})
+          AND EXISTS (SELECT 1 FROM enrolledItems e WHERE ${match})
+          AND NOT EXISTS (SELECT 1 FROM enrolledItems e WHERE ${match} AND e.status = 'active' AND (e.expiresAt IS NULL OR e.expiresAt > NOW()))`);
+    const list = (Array.isArray(res) ? res[0] : res?.rows) ?? [];
+    return new Set(list.map((r: any) => r.id as string));
+}
+
 /** Student is enrolled directly (session_users) or through a group. */
 async function isEnrolled(studentId: string, sessionId: string): Promise<boolean> {
+    // cancelled by the student and accepted by the admin → no longer theirs
+    const [cancelled] = await db.select({ id: studentCancelRequests.id }).from(studentCancelRequests)
+        .where(and(eq(studentCancelRequests.sessionId, sessionId), eq(studentCancelRequests.studentId, studentId), eq(studentCancelRequests.status, "accepted")))
+        .limit(1);
+    if (cancelled) return false;
+
     const [direct] = await db
         .select({ id: sessionUsers.id })
         .from(sessionUsers)
@@ -91,6 +117,9 @@ async function isEnrolled(studentId: string, sessionId: string): Promise<boolean
 
 /** Sub-query: every session the student is enrolled in (direct OR via group). */
 const enrolledSessionsFilter = (studentId: string) =>
+    and(
+    // a session the student cancelled (admin accepted) is gone for them, even through a group
+    notCancelledByStudent(studentId),
     or(
         inArray(
             sessions.id,
@@ -108,7 +137,7 @@ const enrolledSessionsFilter = (studentId: string) =>
                     )
                 )
         )
-    );
+    ));
 
 type StudentPdfRow = {
     sessionId: string;
@@ -353,6 +382,7 @@ export const getSessionHistory = async (req: Request, res: Response) => {
             timeTo: sessions.timeTo,
             sessionLink: sessions.session_link,
             materialLink: sessions.material_link,
+            recordingLink: sessions.recordingLink,
             sessionRelationalType: sessions.sessionRelationalType,
             teacher_explanation_pdf: sessions.teacher_explanation_pdf,
             status: sessions.status,
@@ -410,6 +440,7 @@ export const getSessionHistory = async (req: Request, res: Response) => {
                 timeTo: row.timeTo,
                 sessionLink: row.sessionLink,
                 materialLink: row.materialLink,
+                recordingLink: row.recordingLink,
                 sessionRelationalType: row.sessionRelationalType,
                 teacher_explanation_pdf: row.teacher_explanation_pdf,
                 status: row.status,
@@ -449,6 +480,8 @@ export const getSessionHistory = async (req: Request, res: Response) => {
         }
     });
     const ideasByLesson = await fetchIdeasByLesson(attendedLessonIds);
+    // lessons whose access ran out (contentAccessDays) stay locked here too, like on the lesson page
+    const expired = await expiredLessonIds(studentId, attendedLessonIds);
 
     const formattedSessions: any[] = [];
     pastSessionIds.forEach((sId) => {
@@ -467,6 +500,8 @@ export const getSessionHistory = async (req: Request, res: Response) => {
             timeTo: s.timeTo,
             sessionLink: s.sessionLink,
             materialLink: s.materialLink,
+            // the class recording the teacher added — only for students who attended
+            recordingLink: isAttended ? s.recordingLink || null : null,
             sessionRelationalType: s.sessionRelationalType,
             status: s.status,
             cancelReason: s.cancelReason,
@@ -476,8 +511,9 @@ export const getSessionHistory = async (req: Request, res: Response) => {
             ...pdfData,
             lessons: s.lessons.map((l: any) => ({
                 ...l,
-                ideas: isAttended ? (ideasByLesson.get(l.id) || []) : [],
-                ideasLocked: !isAttended,
+                ideas: isAttended && !expired.has(l.id) ? (ideasByLesson.get(l.id) || []) : [],
+                ideasLocked: !isAttended || expired.has(l.id),
+                accessExpired: isAttended && expired.has(l.id),
             })),
         });
     });
@@ -501,6 +537,7 @@ export const getSessionDetails = async (req: Request, res: Response) => {
             timeTo: sessions.timeTo,
             sessionLink: sessions.session_link,
             materialLink: sessions.material_link,
+            recordingLink: sessions.recordingLink,
             sessionRelationalType: sessions.sessionRelationalType,
             teacher_explanation_pdf: sessions.teacher_explanation_pdf,
             teacherId: sessions.teacherId,
@@ -573,13 +610,15 @@ export const getSessionDetails = async (req: Request, res: Response) => {
     const ideasByLesson = isAttended
         ? await fetchIdeasByLesson(sessionLessonRows.map(r => r.lesson.id))
         : new Map<string, any[]>();
+    const expired = isAttended ? await expiredLessonIds(studentId, sessionLessonRows.map(r => r.lesson.id)) : new Set<string>();
 
     const formattedLessons = sessionLessonRows.map(row => ({
         ...row.lesson,
         chapter: row.chapter,
         course: row.course,
-        ideas: isAttended ? (ideasByLesson.get(row.lesson.id) || []) : [],
-        ideasLocked: !isAttended,
+        ideas: isAttended && !expired.has(row.lesson.id) ? (ideasByLesson.get(row.lesson.id) || []) : [],
+        ideasLocked: !isAttended || expired.has(row.lesson.id),
+        accessExpired: isAttended && expired.has(row.lesson.id),
     }));
 
     return SuccessResponse(res, {
@@ -594,6 +633,7 @@ export const getSessionDetails = async (req: Request, res: Response) => {
             timeTo: session.timeTo,
             sessionLink: session.sessionLink,
             materialLink: session.materialLink,
+            recordingLink: isAttended ? session.recordingLink || null : null,
             sessionRelationalType: session.sessionRelationalType,
             ...pdfData,
             teacher: teacher ?? null,

@@ -1,4 +1,5 @@
 import { Request, Response } from "express";
+import { notCancelledByStudent } from "../../utils/sessionVisibility";
 import { eq, and, gte, or, sql, inArray } from "drizzle-orm";
 import { db } from "../../models/connection";
 import { Student } from "../../models/schema/admin/Student";
@@ -18,6 +19,7 @@ const upcomingSessionsCount = async (studentId: string): Promise<number> => {
         .from(sessions)
         .where(and(
             gte(sessions.sessionDate, new Date(today)),
+            notCancelledByStudent(studentId), // cancelled by the student and accepted by the admin
             or(
                 inArray(sessions.id, db.select({ sessionId: sessionUsers.sessionId }).from(sessionUsers).where(eq(sessionUsers.studentId, studentId))),
                 inArray(sessions.id, db.select({ sessionId: sessionGroups.sessionId }).from(sessionGroups).where(inArray(sessionGroups.groupId, db.select({ groupId: groupStudents.groupId }).from(groupStudents).where(eq(groupStudents.studentId, studentId)))))

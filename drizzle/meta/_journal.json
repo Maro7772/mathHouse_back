@@ -190,6 +190,13 @@
       "when": 1795076680621,
       "tag": "0026_lesson_attendance_exam_assign",
       "breakpoints": true
+    },
+    {
+      "idx": 27,
+      "version": "5",
+      "when": 1795338828955,
+      "tag": "0027_session_recording_link",
+      "breakpoints": true
     }
   ]
 }

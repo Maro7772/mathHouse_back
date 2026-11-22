@@ -6,8 +6,7 @@ import {
     getTeacherSessionById,
     getSessionStudents,
     uploadTeacherExplanationPdf,
-    deleteTeacherExplanationPdf,
-} from "../../controllers/teacher/sessions";
+    deleteTeacherExplanationPdf, saveRecordingLink } from "../../controllers/teacher/sessions";
 import {
     getSessionRatings,
     getStudentSessionRatings,
@@ -44,6 +43,8 @@ router.post("/:id/explanation-pdf", catchAsync(uploadTeacherExplanationPdf));
 
 // DELETE /api/teacher/sessions/:id/explanation-pdf     — delete teacher explanation PDF
 router.delete("/:id/explanation-pdf", catchAsync(deleteTeacherExplanationPdf));
+// after class: the Google Drive link of the recording
+router.put("/:id/recording", catchAsync(saveRecordingLink));
 
 // PATCH /api/teacher/sessions/:id/meeting-link        — publish / clear the meeting link for students
 router.patch("/:id/meeting-link", validate(meetingLinkSchema), catchAsync(updateMeetingLink));

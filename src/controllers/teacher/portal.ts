@@ -1,4 +1,5 @@
 // controllers/teacher/portal.ts
+import { teacherCanSeeSession, notCancelledByStudent } from "../../utils/sessionVisibility"; // study-plan proposals and emptied sessions stay hidden
 // Teacher portal actions: meeting link, attendance, cover/cancellation requests,
 // weekly availability and notifications.
 import { Request, Response } from "express";
@@ -30,7 +31,7 @@ const getOwnSession = async (teacherId: string, sessionId: string) => {
             contentAccessDays: sessions.contentAccessDays,
         })
         .from(sessions)
-        .where(and(eq(sessions.id, sessionId), eq(sessions.teacherId, teacherId)));
+        .where(and(eq(sessions.id, sessionId), eq(sessions.teacherId, teacherId), teacherCanSeeSession()));
     if (!session) throw new NotFound("Session not found or not assigned to you");
     return session;
 };
@@ -72,7 +73,7 @@ export const saveAttendance = async (req: Request, res: Response) => {
         db.select({ studentId: groupStudents.studentId })
             .from(sessionGroups)
             .innerJoin(groupStudents, eq(sessionGroups.groupId, groupStudents.groupId))
-            .where(eq(sessionGroups.sessionId, session.id)),
+            .where(and(eq(sessionGroups.sessionId, session.id), notCancelledByStudent(groupStudents.studentId, sessionGroups.sessionId))),
     ]);
     const assigned = new Set([...directRows, ...groupRows].map(r => r.studentId));
     const unknown = entries.filter(e => !assigned.has(e.studentId));
@@ -239,10 +240,8 @@ export const getMyAvailability = async (req: Request, res: Response) => {
     return SuccessResponse(res, { message: "Availability fetched successfully", ...(await loadAvailability(teacherId)) });
 };
 
-/** PUT /teacher/availability — replaces the whole week and shares it with admin. */
-export const saveMyAvailability = async (req: Request, res: Response) => {
-    const teacherId = getTeacherId(req);
-    const slots: { dayOfWeek: number; timeFrom: string; timeTo: string }[] = req.body.slots;
+/** Replaces a teacher's whole week (used by the teacher and by the admin). Overlapping ranges on a day are refused. */
+export const replaceTeacherAvailability = async (teacherId: string, slots: { dayOfWeek: number; timeFrom: string; timeTo: string }[]) => {
 
     // reject overlapping ranges on the same day
     const byDay = new Map<number, { from: string; to: string }[]>();
@@ -264,7 +263,12 @@ export const saveMyAvailability = async (req: Request, res: Response) => {
             })));
         }
     });
+};
 
+/** PUT /teacher/availability — replaces the whole week and shares it with admin. */
+export const saveMyAvailability = async (req: Request, res: Response) => {
+    const teacherId = getTeacherId(req);
+    await replaceTeacherAvailability(teacherId, req.body.slots);
     return SuccessResponse(res, { message: "Availability saved and shared with admin", ...(await loadAvailability(teacherId)) });
 };
 

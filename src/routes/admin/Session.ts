@@ -17,8 +17,7 @@ import {
     deleteSession,
     upsertSessionStudentPdfs,
     deleteSessionStudentPdf,
-    manualAttendSessions,
-} from "../../controllers/admin/Session";
+    manualAttendSessions, getTeacherStatesForSchedule } from "../../controllers/admin/Session";
 import { catchAsync } from "../../utils/catchAsync";
 import { requirePermission } from "../../middlewares/requirePermission";
 import { selectionLessons } from "../../controllers/admin/lessons";
@@ -35,6 +34,8 @@ router.get("/select/chapter/:courseId", requirePermission("sessions", "View"), c
 router.get("/select/lesson/:chapterId", requirePermission("sessions", "View"), catchAsync(selectLesson));
 router.get("/select/students", requirePermission("sessions", "View"), catchAsync(selectStudents));
 router.get("/select/teachers", requirePermission("sessions", "View"), catchAsync(selectTeachers));
+// which teachers are free / busy / outside hours for a schedule (Add / Edit Session picker)
+router.post("/teacher-states", requirePermission("sessions", "View"), catchAsync(getTeacherStatesForSchedule));
 router.get("/select/groups", requirePermission("sessions", "View"), catchAsync(selectGroups));
 router.post("/students/attendance", requirePermission("sessions", "View"), catchAsync(getStudentsCourseAttendance));
 

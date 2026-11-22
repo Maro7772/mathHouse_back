@@ -1,4 +1,7 @@
 import { Request, Response } from "express";
+import { ymd } from "../../utils/teacherSchedule";
+import { sendStudentNotification } from "../../utils/studentNotification";
+import { teacherCanSeeSession, notCancelledByStudent } from "../../utils/sessionVisibility"; // study-plan proposals and emptied sessions stay hidden
 import { randomUUID } from "crypto";
 import { db } from "../../models/connection";
 import { sessions, sessionLessons, sessionUsers, sessionGroups, sessionAttendance, sessionStudentPdfs } from "../../models/schema/admin/Session";
@@ -32,7 +35,8 @@ const resolveIdea = (idea: {
     const { bunnyGuid, video, ...rest } = idea;
     let videoPayload: { type: "bunny"; streamUrl: string } | { type: "external"; url: string } | null = null;
     if (bunnyGuid) {
-        videoPayload = { type: "bunny", streamUrl: generateSecureStreamUrl(bunnyGuid) };
+        // a missing Bunny setting must not break the whole session list — that one video is just left out
+        try { videoPayload = { type: "bunny", streamUrl: generateSecureStreamUrl(bunnyGuid) }; } catch { videoPayload = null; }
     } else if (video) {
         videoPayload = { type: "external", url: video };
     }
@@ -225,7 +229,7 @@ async function fetchSessionStudentsLite(sessionIds: string[]) {
         db.select({ sessionId: sessionGroups.sessionId, studentId: groupStudents.studentId })
             .from(sessionGroups)
             .innerJoin(groupStudents, eq(sessionGroups.groupId, groupStudents.groupId))
-            .where(inArray(sessionGroups.sessionId, sessionIds)),
+            .where(and(inArray(sessionGroups.sessionId, sessionIds), notCancelledByStudent(groupStudents.studentId, sessionGroups.sessionId))),
         db.select({ sessionId: sessionAttendance.sessionId, studentId: sessionAttendance.studentId, status: sessionAttendance.status })
             .from(sessionAttendance)
             .where(inArray(sessionAttendance.sessionId, sessionIds)),
@@ -286,6 +290,7 @@ export const getAllTeacherSessions = async (req: Request, res: Response) => {
             timeTo: sessions.timeTo,
             sessionLink: sessions.session_link,
             materialLink: sessions.material_link,
+            recordingLink: sessions.recordingLink,
             sessionRelationalType: sessions.sessionRelationalType,
             contentAccessDays: sessions.contentAccessDays,
             session_pdf: sessions.session_pdf,
@@ -298,7 +303,7 @@ export const getAllTeacherSessions = async (req: Request, res: Response) => {
             createdAt: sessions.createdAt,
         })
         .from(sessions)
-        .where(eq(sessions.teacherId, teacherId))
+        .where(and(eq(sessions.teacherId, teacherId), teacherCanSeeSession()))
         .orderBy(desc(sessions.sessionDate), desc(sessions.timeFrom));
 
     const sessionIds = rawSessions.map(s => s.id);
@@ -358,6 +363,7 @@ export const getUpcomingTeacherSessions = async (req: Request, res: Response) =>
             timeTo: sessions.timeTo,
             sessionLink: sessions.session_link,
             materialLink: sessions.material_link,
+            recordingLink: sessions.recordingLink,
             sessionRelationalType: sessions.sessionRelationalType,
             contentAccessDays: sessions.contentAccessDays,
             session_pdf: sessions.session_pdf,
@@ -371,7 +377,7 @@ export const getUpcomingTeacherSessions = async (req: Request, res: Response) =>
         .from(sessions)
         .where(
             and(
-                eq(sessions.teacherId, teacherId),
+                eq(sessions.teacherId, teacherId), teacherCanSeeSession(),
                 sql`(
                     ${sessions.sessionDate} > ${today}
                     OR (${sessions.sessionDate} = ${today} AND ${sessions.timeTo} >= ${currentTime})
@@ -433,6 +439,7 @@ export const getPastTeacherSessions = async (req: Request, res: Response) => {
             timeTo: sessions.timeTo,
             sessionLink: sessions.session_link,
             materialLink: sessions.material_link,
+            recordingLink: sessions.recordingLink,
             sessionRelationalType: sessions.sessionRelationalType,
             contentAccessDays: sessions.contentAccessDays,
             session_pdf: sessions.session_pdf,
@@ -446,7 +453,7 @@ export const getPastTeacherSessions = async (req: Request, res: Response) => {
         .from(sessions)
         .where(
             and(
-                eq(sessions.teacherId, teacherId),
+                eq(sessions.teacherId, teacherId), teacherCanSeeSession(),
                 sql`(
                     ${sessions.sessionDate} < ${today}
                     OR (${sessions.sessionDate} = ${today} AND ${sessions.timeTo} < ${currentTime})
@@ -503,6 +510,7 @@ export const getTeacherSessionById = async (req: Request, res: Response) => {
             timeTo: sessions.timeTo,
             sessionLink: sessions.session_link,
             materialLink: sessions.material_link,
+            recordingLink: sessions.recordingLink,
             teacherMaterialLink: sessions.teacher_material_link,
             sessionRelationalType: sessions.sessionRelationalType,
             contentAccessDays: sessions.contentAccessDays,
@@ -516,7 +524,7 @@ export const getTeacherSessionById = async (req: Request, res: Response) => {
             createdAt: sessions.createdAt,
         })
         .from(sessions)
-        .where(and(eq(sessions.id, id), eq(sessions.teacherId, teacherId)));
+        .where(and(eq(sessions.id, id), eq(sessions.teacherId, teacherId), teacherCanSeeSession()));
 
     if (!session) throw new NotFound("Session not found");
 
@@ -544,7 +552,7 @@ export const getTeacherSessionById = async (req: Request, res: Response) => {
         .select({ studentId: groupStudents.studentId })
         .from(sessionGroups)
         .innerJoin(groupStudents, eq(sessionGroups.groupId, groupStudents.groupId))
-        .where(eq(sessionGroups.sessionId, id));
+        .where(and(eq(sessionGroups.sessionId, id), notCancelledByStudent(groupStudents.studentId, sessionGroups.sessionId)));
 
     const allStudentIds = new Set([
         ...directStudents.map(s => s.studentId),
@@ -607,7 +615,7 @@ export const getSessionStudents = async (req: Request, res: Response) => {
             sessionRelationalType: sessions.sessionRelationalType,
         })
         .from(sessions)
-        .where(and(eq(sessions.id, sessionId), eq(sessions.teacherId, teacherId)));
+        .where(and(eq(sessions.id, sessionId), eq(sessions.teacherId, teacherId), teacherCanSeeSession()));
 
     if (!session) throw new NotFound("Session not found");
 
@@ -632,7 +640,7 @@ export const getSessionStudents = async (req: Request, res: Response) => {
         })
         .from(sessionGroups)
         .innerJoin(groupStudents, eq(sessionGroups.groupId, groupStudents.groupId))
-        .where(eq(sessionGroups.sessionId, sessionId));
+        .where(and(eq(sessionGroups.sessionId, sessionId), notCancelledByStudent(groupStudents.studentId, sessionGroups.sessionId)));
 
     // Merge & deduplicate
     const studentMap = new Map<string, { studentId: string; enrollmentType: string; groupId?: string }>();
@@ -816,7 +824,7 @@ export const uploadTeacherExplanationPdf = async (req: Request, res: Response) =
     const [session] = await db
         .select()
         .from(sessions)
-        .where(and(eq(sessions.id, sessionId), eq(sessions.teacherId, teacherId)));
+        .where(and(eq(sessions.id, sessionId), eq(sessions.teacherId, teacherId), teacherCanSeeSession()));
 
     if (!session) throw new NotFound("Session not found or not assigned to you");
 
@@ -928,7 +936,7 @@ export const deleteTeacherExplanationPdf = async (req: Request, res: Response) =
     const [session] = await db
         .select()
         .from(sessions)
-        .where(and(eq(sessions.id, sessionId), eq(sessions.teacherId, teacherId)));
+        .where(and(eq(sessions.id, sessionId), eq(sessions.teacherId, teacherId), teacherCanSeeSession()));
 
     if (!session) throw new NotFound("Session not found or not assigned to you");
 
@@ -963,3 +971,37 @@ export const deleteTeacherExplanationPdf = async (req: Request, res: Response) =
     return SuccessResponse(res, { message: "Teacher explanation PDF deleted successfully" }, 200);
 };
 
+
+/**
+ * PUT /teacher/sessions/:id/recording — body { recordingLink: string | null }
+ * After class the teacher adds the Google Drive link of the recording (null removes it).
+ * Students who attended see it on their session page; they are told when it is first added.
+ */
+export const saveRecordingLink = async (req: Request, res: Response) => {
+    const teacherId = getTeacherId(req);
+    const { id: sessionId } = req.params;
+    const raw = req.body?.recordingLink;
+    const link = typeof raw === "string" ? raw.trim() : null;
+    if (link && !/^https:\/\/\S+$/i.test(link)) throw new BadRequest("Paste the full recording link (it starts with https://)");
+    if (link && link.length > 500) throw new BadRequest("That link is too long");
+
+    const [session] = await db.select({ id: sessions.id, name: sessions.name, status: sessions.status, date: sessions.sessionDate, timeFrom: sessions.timeFrom, recordingLink: sessions.recordingLink })
+        .from(sessions).where(and(eq(sessions.id, sessionId), eq(sessions.teacherId, teacherId), teacherCanSeeSession()));
+    if (!session) throw new NotFound("Session not found or not assigned to you");
+    if (session.status === "cancelled") throw new BadRequest("This session was cancelled");
+    const startsAt = session.date ? new Date(`${ymd(session.date)}T${String(session.timeFrom || "00:00:00").slice(0, 8)}`) : null;
+    if (link && startsAt && startsAt.getTime() > Date.now() + 15 * 60 * 1000) throw new BadRequest("Add the recording after the session starts");
+
+    await db.update(sessions).set({ recordingLink: link || null }).where(eq(sessions.id, sessionId));
+
+    // first time a recording is added → tell the students who attended
+    let notified = 0;
+    if (link && !session.recordingLink) {
+        const present = await db.select({ studentId: sessionAttendance.studentId }).from(sessionAttendance)
+            .where(and(eq(sessionAttendance.sessionId, sessionId), eq(sessionAttendance.status, "present")));
+        for (const p of present) {
+            try { await sendStudentNotification(p.studentId, `The recording of "${session.name}" is ready — open the session to watch it.`); notified++; } catch { /* not critical */ }
+        }
+    }
+    return SuccessResponse(res, { message: link ? "Recording link saved" : "Recording link removed", recordingLink: link || null, studentsNotified: notified });
+};

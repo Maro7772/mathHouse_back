@@ -1,4 +1,6 @@
 import { Request, Response } from "express";
+import { assertTeacherFree, teacherStatesFor, Slot, ymd } from "../../utils/teacherSchedule";
+import { sessionsToMove, notifyReassign } from "../../utils/sessionReassign";
 import { randomUUID } from "crypto";
 import { db } from "../../models/connection";
 import { sessionRatings, sessionGroups, sessions, sessionUsers, sessionStudentPdfs, sessionPackageDeductions } from "../../models/schema/admin/Session";
@@ -313,6 +315,8 @@ export const createSession = async (req: Request, res: Response) => {
     // ── 4. Teacher validation ─────────────────────────────────────────────
     const teacher = await db.select().from(teachers).where(eq(teachers.id, teacherId)).limit(1);
     if (teacher.length === 0) throw new BadRequest("Teacher not found");
+    // not double-booked and inside the teacher's working hours — for every date (one-off or repeating)
+    await assertTeacherFree(teacherId, targetSchedules);
 
     // ── 5. Category hierarchy validation ─────────────────────────────────
     const parentCat = await db.select().from(category).where(eq(category.id, categoryId)).limit(1);
@@ -1269,6 +1273,20 @@ export const updateSession = async (req: Request, res: Response) => {
         }
     }
 
+    // ── 14b. Teacher free at the (new) time, inside working hours ─────────────
+    // a teacher change is a reassignment: everyone is told after saving (Phase C)
+    const reassigned = teacherId && teacherId !== currentSession.teacherId ? await sessionsToMove([id], teacherId) : [];
+    {
+        const effTeacher = teacherId || currentSession.teacherId;
+        const slot = isChangingSchedule && targetSchedules.length === 1
+            ? targetSchedules[0]
+            : currentSession.sessionDate ? { date: ymd(currentSession.sessionDate), from: String(currentSession.timeFrom), to: String(currentSession.timeTo) } : null;
+        const teacherChanged = !!teacherId && teacherId !== currentSession.teacherId;
+        if (slot && currentSession.status === "scheduled" && (teacherChanged || isChangingSchedule)) {
+            await assertTeacherFree(effTeacher, [{ date: ymd(slot.date), from: String(slot.from), to: String(slot.to) }], [id]);
+        }
+    }
+
     // ── 15. Persist in one transaction ───────────────────────────────────
     await db.transaction(async (tx) => {
         // 15a. Update core session fields
@@ -1365,6 +1383,11 @@ export const updateSession = async (req: Request, res: Response) => {
             }
         }
     });
+
+    if (reassigned.length && teacherId) {
+        const [fresh] = await db.select({ date: sessions.sessionDate, from: sessions.timeFrom, to: sessions.timeTo, name: sessions.name }).from(sessions).where(eq(sessions.id, id));
+        await notifyReassign(reassigned.map((m) => ({ ...m, ...(fresh || {}) })), teacherId);
+    }
 
     return SuccessResponse(res, { message: "Session updated successfully" }, 200);
 };
@@ -1784,4 +1807,31 @@ export const manualAttendSessions = async (req: Request, res: Response) => {
         totalUnpaid: attendanceResults.reduce((n, r) => n + r.unpaidSessions, 0),
         results: attendanceResults,
     }, 200);
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/admin/session/teacher-states — for the Add / Edit Session teacher picker
+// body: the same schedule fields as create (scheduleType, sessionDate, timeFrom, timeTo,
+//       startDate, endDate, recurringDays) + optional skipSessionId (the session being edited).
+// → { slots: n, teachers: [{ id, name, state: free | busy | off | not_shared, reason }] }
+// ─────────────────────────────────────────────────────────────────────────────
+export const getTeacherStatesForSchedule = async (req: Request, res: Response) => {
+    const b = req.body || {};
+    const slots: Slot[] = [];
+    if (b.scheduleType === "repeat") {
+        if (b.startDate && b.endDate && Array.isArray(b.recurringDays) && b.recurringDays.length) {
+            const days = b.recurringDays
+                .map((d: any) => ({ num: daysMap[String(d?.dayOfWeek || "").toLowerCase()], from: d?.timeFrom, to: d?.timeTo }))
+                .filter((d: any) => d.num !== undefined && d.from && d.to);
+            for (const date of getRecurringDates(b.startDate, b.endDate, days.map((d: any) => d.num))) {
+                const cfg = days.find((d: any) => d.num === new Date(date).getDay());
+                if (cfg) slots.push({ date, from: cfg.from, to: cfg.to });
+            }
+        }
+    } else if (b.sessionDate && b.timeFrom && b.timeTo) {
+        slots.push({ date: String(b.sessionDate).slice(0, 10), from: b.timeFrom, to: b.timeTo });
+    }
+    if (!slots.length) return SuccessResponse(res, { slots: 0, teachers: [] });
+    const teachersOut = await teacherStatesFor(slots, b.skipSessionId ? [String(b.skipSessionId)] : []);
+    return SuccessResponse(res, { slots: slots.length, teachers: teachersOut });
 };

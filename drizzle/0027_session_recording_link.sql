@@ -1,0 +1,1 @@
+ALTER TABLE `sessions` ADD `recording_link` varchar(500);

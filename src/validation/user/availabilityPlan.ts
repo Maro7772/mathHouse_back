@@ -72,4 +72,6 @@ export const updateAvailabilityPlanSchema = z.object({
 export const respondToPlanSchema = z.object({
     action: z.enum(["accept", "reject"]),
     feedback: z.string().max(1000).optional(),
+    // sessions the student declines (the rest of the waiting ones are accepted) — was stripped before, so partial answers never worked
+    rejectedSessionIds: z.array(z.string().min(1)).optional(),
 });
