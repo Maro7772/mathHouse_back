@@ -20,7 +20,7 @@ import {
     driveAssets,
     driveFolders,
 } from "../../models/schema";
-import { eq, count, desc, like, or, SQL, and, isNull, asc } from "drizzle-orm";
+import { eq, count, desc, like, or, SQL, and, isNull, asc, sql } from "drizzle-orm";
 import { NotFound } from "../../Errors";
 import { addGenerationJob } from "../../queues/questionQueue";
 import { validateAndSaveLogo, deleteImage, handleImageUpdate, validateAndSavePdf } from "../../utils/handleImages";
@@ -570,12 +570,18 @@ export const getQuestionsbyCourseId = async (req: Request, res: Response) => {
     const difficulty = req.query.difficulty as string | undefined;
     const year = req.query.year as string | undefined;
     const month = req.query.month as string | undefined;
+    // a whole module: exam code + year + month + section ("none" = not set)
+    const codeId = req.query.codeId as string | undefined;
+    const sectionId = req.query.sectionId as string | undefined;
+    const isModule = !!codeId;
     const finalCondition = and(
         eq(lessons.courseId, courseId),
         searchCondition,
         difficulty ? eq(questions.difficulty, difficulty as any) : undefined,
-        year ? eq(questions.year, parseInt(year)) : undefined,
-        month ? eq(questions.month, month as any) : undefined,
+        year === "none" ? isNull(questions.year) : year ? eq(questions.year, parseInt(year)) : undefined,
+        month === "none" ? isNull(questions.month) : month ? eq(questions.month, month as any) : undefined,
+        codeId ? eq(questions.codeId, codeId) : undefined,
+        sectionId === "none" ? isNull(questions.sectionId) : sectionId ? eq(questions.sectionId, sectionId) : undefined,
     );
 
     const [totalQueries] = await db.select({ count: count() })
@@ -621,7 +627,8 @@ export const getQuestionsbyCourseId = async (req: Request, res: Response) => {
         .where(finalCondition)
         .limit(limit)
         .offset(offset)
-        .orderBy(desc(questions.createdAt));
+        // a module keeps the order its questions were added in (question 1 first)
+        .orderBy(...(isModule ? [asc(questions.createdAt), asc(questions.id)] : [desc(questions.createdAt)]));
 
     return SuccessResponse(res, {
         message: "Questions fetched successfully",
@@ -1098,4 +1105,33 @@ export const selectDriveContents = async (req: Request, res: Response) => {
             files
         }
     }, 200);
+};
+
+// GET /api/admin/questions/modules[?courseId] — the question bank grouped into modules
+// (exam code + year + month + section), with how many questions each has. "Add a full module" in the
+// exam / diagnostic question picker lists these, then loads the module's questions from /course/:courseId.
+const MONTH_ORDER = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+export const getQuestionModules = async (req: Request, res: Response) => {
+    const courseId = req.query.courseId ? String(req.query.courseId) : null;
+    const result: any = await db.execute(sql`
+        SELECT q.code_id AS codeId, c.code, q.year, q.month, q.section_id AS sectionId, s.section_name AS sectionName, COUNT(*) AS count
+        FROM questions q
+        JOIN lessons l ON l.id = q.lesson_id
+        JOIN exam_codes c ON c.id = q.code_id
+        LEFT JOIN sections s ON s.id = q.section_id
+        WHERE 1 = 1 ${courseId ? sql`AND l.course_id = ${courseId}` : sql``}
+        GROUP BY q.code_id, c.code, q.year, q.month, q.section_id, s.section_name`);
+    const rows: any[] = (Array.isArray(result) ? result[0] : result?.rows) ?? [];
+    const modules = rows.map((r) => ({
+        codeId: r.codeId, code: r.code,
+        year: r.year === null || r.year === undefined ? null : Number(r.year),
+        month: r.month || null,
+        sectionId: r.sectionId || null, sectionName: r.sectionName || null,
+        count: Number(r.count) || 0,
+    })).sort((a, b) =>
+        (b.year ?? -1) - (a.year ?? -1)
+        || MONTH_ORDER.indexOf(b.month ?? "") - MONTH_ORDER.indexOf(a.month ?? "")
+        || String(a.code).localeCompare(String(b.code))
+        || String(a.sectionName ?? "~").localeCompare(String(b.sectionName ?? "~")));
+    return SuccessResponse(res, { modules }, 200);
 };

@@ -19,6 +19,7 @@ import {
     getQuestionsbyCourseId,
     getQuestionsbySectiondId,
     selectDriveContents,
+    getQuestionModules,
 } from "../../controllers/admin/questions";
 import { getExamCodes } from "../../controllers/admin/examCodes";
 import { selectLessons } from "../../controllers/admin/lessons";
@@ -45,6 +46,7 @@ router.delete("/parallel/:id",                   requirePermission("questions", 
 
 // ── Main questions ────────────────────────────────────────────────────────
 router.get("/",                                  requirePermission("questions", "View"),   catchAsync(getAllQuestions));
+router.get("/modules",                           requirePermission("questions", "View"),   catchAsync(getQuestionModules));
 router.get("/course/:courseId",                  requirePermission("questions", "View"),   catchAsync(getQuestionsbyCourseId));
 router.get("/lesson/:id",                        requirePermission("questions", "View"),   catchAsync(getQuestionsbyLessonId));
 router.get("/section/:sectionId",                requirePermission("questions", "View"),   catchAsync(getQuestionsbySectiondId));
