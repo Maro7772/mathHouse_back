@@ -74,7 +74,7 @@ export const getStudentsReport = async (_req: Request, res: Response) => {
         WHERE e.status = 'active'`);
     const paidRows = await rows(sql`
         SELECT studentId, SUM(amount) AS paid, MAX(createdAt) AS lastPayment
-        FROM payment WHERE status = 'completed' AND isDeleted = 0 AND studentId IS NOT NULL
+        FROM payment WHERE status = 'completed' AND isDeleted = 0 AND studentId IS NOT NULL AND paymentMethodId <> 'wallet00-0000-4000-8000-000000000000'
         GROUP BY studentId`);
     const attendRows = await rows(sql`
         SELECT student_id AS studentId, SUM(status = 'present') AS present, SUM(status = 'absent') AS absent,
@@ -333,23 +333,23 @@ export const getPaymentsReport = async (req: Request, res: Response) => {
 
     const byStatus = await rows(sql`
         SELECT p.status, COUNT(*) AS n, COALESCE(SUM(p.amount), 0) AS amount
-        FROM payment p WHERE ${inRange} GROUP BY p.status`);
+        FROM payment p WHERE ${inRange} AND p.paymentMethodId <> 'wallet00-0000-4000-8000-000000000000' GROUP BY p.status`);
     const [pendingAll] = await rows(sql`
         SELECT COUNT(*) AS n, COALESCE(SUM(amount), 0) AS amount FROM payment WHERE status = 'pending' AND isDeleted = 0`);
 
     const byMethod = await rows(sql`
         SELECT COALESCE(pm.name, 'Unknown') AS name, COUNT(*) AS n, SUM(p.amount) AS amount
         FROM payment p LEFT JOIN paymentMethod pm ON pm.id = p.paymentMethodId
-        WHERE ${inRange} AND p.status = 'completed' GROUP BY pm.name ORDER BY amount DESC`);
+        WHERE ${inRange} AND p.status = 'completed' AND p.paymentMethodId <> 'wallet00-0000-4000-8000-000000000000' GROUP BY pm.name ORDER BY amount DESC`);
     const byPurpose = await rows(sql`
         SELECT ${PURPOSE} AS name, COUNT(*) AS n, SUM(p.amount) AS amount
-        FROM payment p WHERE ${inRange} AND p.status = 'completed' GROUP BY name ORDER BY amount DESC`);
+        FROM payment p WHERE ${inRange} AND p.status = 'completed' AND p.paymentMethodId <> 'wallet00-0000-4000-8000-000000000000' GROUP BY name ORDER BY amount DESC`);
 
     // Last 12 months of collected money (ignores the from/to filter on purpose).
     const monthly = await rows(sql`
         SELECT DATE_FORMAT(p.createdAt, '%Y-%m') AS month, SUM(p.amount) AS amount, COUNT(*) AS n
         FROM payment p
-        WHERE p.status = 'completed' AND p.isDeleted = 0
+        WHERE p.status = 'completed' AND p.isDeleted = 0 AND p.paymentMethodId <> 'wallet00-0000-4000-8000-000000000000'
           AND p.createdAt >= DATE_SUB(DATE_FORMAT(CURDATE(), '%Y-%m-01'), INTERVAL 11 MONTH)
         GROUP BY month ORDER BY month`);
     const months: { month: string; amount: number; count: number }[] = [];

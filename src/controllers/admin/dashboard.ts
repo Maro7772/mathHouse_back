@@ -1,5 +1,6 @@
 import { Request, Response } from "express";
 import { db } from "../../models/connection";
+import { notWalletPaid } from "../../utils/walletPay";
 import {
     sessions,
     sessionAttendance,
@@ -294,6 +295,7 @@ export const getDashboard = async (req: Request, res: Response) => {
         .where(
             and(
                 eq(payment.status, "completed"),
+                notWalletPaid(payment.paymentMethodId),
                 gte(payment.createdAt, startDate),
                 lte(payment.createdAt, endDate)
             )

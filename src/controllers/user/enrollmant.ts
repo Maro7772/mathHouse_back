@@ -557,6 +557,7 @@ import { validateAndSaveLogo } from "../../utils/handleImages";
 import { createPaymobCheckoutSession } from "../../utils/paymob";
 import { validatePromoCode } from "../../utils/promoCodeValidation";
 import { promoCodesUsers } from "../../models/schema";
+import { WALLET_METHOD_ID, ensureWalletMethod, takeFromWallet } from "../../utils/walletPay";
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -738,19 +739,21 @@ export const enrollInCourse = async (req: Request, res: Response) => {
 
         // a. Wallet
         if (paymentType === "wallet") {
-            const [sw] = await tx.select().from(wallet).where(eq(wallet.studentId, studentId));
-            if (!sw) throw new BadRequest("No wallet found for this student. Please contact support.");
-            if (sw.balance < totalPrice) {
-                throw new BadRequest(`Insufficient balance. Your balance is ${sw.balance} EGP, but total is ${totalPrice} EGP`);
-            }
-
-            await tx.update(wallet).set({ balance: sw.balance - totalPrice }).where(eq(wallet.id, sw.id));
-            await tx.insert(walletTransaction).values({
-                walletId: sw.id,
+            // a completed "Wallet" payment keeps the order in the student's order history
+            await ensureWalletMethod(tx);
+            const paymentId = uuidv4();
+            await tx.insert(payment).values({
+                id: paymentId,
+                studentId,
+                paymentMethodId: WALLET_METHOD_ID,
                 amount: totalPrice,
-                type: "withdrawal",
-                source: "Student",
+                status: "completed",
+                source: "student",
+                purpose: "purchase",
+                promoCodeId: appliedPromoCodeId,
             });
+            await takeFromWallet(tx, studentId, totalPrice, paymentId);
+            paymentRecordId = paymentId;
 
             enrollmentStatus = "active";
             paymentStatus = "completed";
@@ -767,7 +770,7 @@ export const enrollInCourse = async (req: Request, res: Response) => {
             if (!paymentMethodId) throw new BadRequest("Payment method ID is required");
 
             const [method] = await tx.select().from(paymentMethod).where(eq(paymentMethod.id, paymentMethodId));
-            if (!method) throw new BadRequest("Invalid payment method");
+            if (!method || method.id === WALLET_METHOD_ID) throw new BadRequest("Invalid payment method");
             if (!method.isActive) throw new BadRequest("Payment method is not active");
             if (method.type !== "Manual") throw new BadRequest("Only manual payment methods are accepted here. Use /enroll/automatic for Paymob.");
 

@@ -1,11 +1,12 @@
 import { Request, Response } from "express";
 import { db } from "../../models/connection";
 import { paymentMethod, paymentMethodCurrency, Currency } from "../../models/schema";
-import { eq, inArray } from "drizzle-orm";
+import { eq, inArray , sql } from "drizzle-orm";
 import { SuccessResponse } from "../../utils/response";
 import { BadRequest } from "../../Errors/BadRequest";
 import crypto from "crypto";
 import { validateAndSaveLogo, handleImageUpdate, deleteImage } from "../../utils/handleImages";
+import { WALLET_METHOD_ID } from "../../utils/walletPay";
 
 export const createPaymentMethod = async (req: Request, res: Response) => {
     const { name, description, type, isActive, currencies, logo } = req.body;
@@ -111,7 +112,8 @@ export const deletePaymentMethod = async (req: Request, res: Response) => {
 };
 
 export const getAllPaymentMethods = async (req: Request, res: Response) => {
-    const methods = await db.select().from(paymentMethod);
+    // the internal "Wallet" method (wallet-paid orders) is not a method the admin manages
+    const methods = await db.select().from(paymentMethod).where(sql`${paymentMethod.id} <> ${WALLET_METHOD_ID}`);
     const methodCurrencies = await db
         .select({
             paymentMethodId: paymentMethodCurrency.paymentMethodId,

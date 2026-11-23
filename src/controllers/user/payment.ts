@@ -8,6 +8,8 @@ import { and, count, desc, eq, like, or, sql, isNotNull } from 'drizzle-orm';
 import { validateAndSaveLogo } from "../../utils/handleImages";
 import { createPaymobCheckoutSession } from "../../utils/paymob";
 import { validatePromoCode } from "../../utils/promoCodeValidation";
+import { promoCodesUsers } from "../../models/schema";
+import { WALLET_METHOD_ID, ensureWalletMethod, takeFromWallet } from "../../utils/walletPay";
 
 const getAuthenticatedStudentId = (req: Request) => {
     const studentId = req.user?.id;
@@ -210,6 +212,75 @@ export const requestPackageBuy = async (req: Request, res: Response) => {
     });
 
     return SuccessResponse(res, { message: 'Package buy request created successfully' }, 201);
+};
+
+/** Same "already bought" rule as the other package checkouts: no second order while one is pending or still in use. */
+async function assertCanBuyPackage(studentId: string, pkg: { id: string; type: string; duration: number | null }) {
+    const [last] = await db.select({ status: payment.status, createdAt: payment.createdAt }).from(payment)
+        .where(and(eq(payment.studentId, studentId), eq(payment.packageId, pkg.id), eq(payment.purpose, "purchase"), eq(payment.isDeleted, false)))
+        .orderBy(desc(payment.createdAt)).limit(1);
+    if (!last) return;
+    if (last.status === "pending") throw new BadRequest("You already have a pending purchase request for this package. Please wait for it to be reviewed before trying again.");
+    if (last.status !== "completed" || !last.createdAt) return;
+    const days = pkg.duration ?? 0;
+    if (days > 0) {
+        const ends = new Date(last.createdAt);
+        ends.setDate(ends.getDate() + days);
+        if (new Date() >= ends) return;
+    }
+    const [b] = await db.select({ live: Student.livebalance, exam: Student.exambalance, question: Student.questionbalance }).from(Student).where(eq(Student.id, studentId)).limit(1);
+    const left = pkg.type === "live" ? b?.live : pkg.type === "exam" ? b?.exam : pkg.type === "question" ? b?.question : 0;
+    if (Number(left) > 0) {
+        throw new BadRequest(days > 0
+            ? "You already have an active subscription for this package. You can repurchase after it expires or remaining items end."
+            : "You already have a completed purchase for this package with remaining items.");
+    }
+}
+
+// POST /api/user/payment/package-buy/wallet { packageId, buyAnswersAddon?|includedAnswers?, promoCode? }
+// Paid from the wallet: the money leaves the wallet now and the package is added to the student's balance at once.
+export const buyPackageWithWallet = async (req: Request, res: Response) => {
+    const studentId = getAuthenticatedStudentId(req);
+    const { packageId, promoCode } = req.body;
+    const wantsAnswers = req.body.buyAnswersAddon === true || req.body.includedAnswers === true;
+    if (!packageId) throw new BadRequest("Package ID is required");
+
+    const [pkg] = await db.select({
+        id: packages.id, name: packages.name, price: packages.price, type: packages.type, number: packages.number,
+        hasAnswers: packages.hasAnswers, answersPrice: packages.answersPrice, duration: packages.duration,
+    }).from(packages).where(eq(packages.id, packageId)).limit(1);
+    if (!pkg) throw new NotFound("Package not found");
+    await assertCanBuyPackage(studentId, pkg);
+
+    // same price rules as the transfer checkout
+    let amount = Number(pkg.price);
+    let answersIncluded = false;
+    if (pkg.type === "exam") {
+        if (pkg.hasAnswers) answersIncluded = true;
+        else if (wantsAnswers) { answersIncluded = true; amount += Number(pkg.answersPrice || 0); }
+    }
+    let promoCodeId: string | undefined;
+    if (promoCode) {
+        const promo = await validatePromoCode(promoCode, studentId, { packageId });
+        promoCodeId = promo.id;
+        amount = Math.round(Math.max(0, amount - amount * (promo.discountAmount / 100)));
+    }
+
+    const student = await getStudentForPackagePayment(studentId);
+    const parentId = await getLinkedParentId(student.parentphone);
+    let balance = 0;
+    await db.transaction(async (tx) => {
+        await ensureWalletMethod(tx);
+        const paymentId = randomUUID();
+        await tx.insert(payment).values({
+            id: paymentId, studentId, parentId, purpose: "purchase", paymentMethodId: WALLET_METHOD_ID,
+            amount, status: "completed", source: "student", packageId, promoCodeId, includedAnswers: answersIncluded, isDeleted: false,
+        });
+        balance = await takeFromWallet(tx, studentId, amount, paymentId);
+        if (promoCodeId) await tx.insert(promoCodesUsers).values({ promoCodeId, userId: studentId });
+        await creditPackageBalance(studentId, packageId, tx);
+    });
+    return SuccessResponse(res, { message: `${pkg.name} was paid from your wallet and added to your account`, amount, walletBalance: balance }, 201);
 };
 
 export const initiateAutomaticPackageBuy = async (req: Request, res: Response) => {
@@ -451,7 +522,7 @@ export const selectPaymentMethods = async (req: Request, res: Response) => {
         type: paymentMethod.type,
         logo: paymentMethod.logo,
         isActive: paymentMethod.isActive,
-    }).from(paymentMethod).where(eq(paymentMethod.isActive, true));
+    }).from(paymentMethod).where(and(eq(paymentMethod.isActive, true), sql`${paymentMethod.id} <> ${WALLET_METHOD_ID}`));
 
     return SuccessResponse(res, {
         message: 'Active payment methods retrieved successfully',

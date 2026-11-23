@@ -576,7 +576,7 @@ async function openCounts(period: string): Promise<Record<string, number>> {
 async function monthTotals(period: string) {
     const { from, to } = ofPeriod(period);
     const [t] = await rows(sql`SELECT
-        (SELECT COALESCE(SUM(amount), 0) FROM payment WHERE status = 'completed' AND isDeleted = 0 AND DATE(createdAt) BETWEEN ${from} AND ${to}) AS collected,
+        (SELECT COALESCE(SUM(amount), 0) FROM payment WHERE status = 'completed' AND isDeleted = 0 AND paymentMethodId <> 'wallet00-0000-4000-8000-000000000000' AND DATE(createdAt) BETWEEN ${from} AND ${to}) AS collected,
         (SELECT COALESCE(SUM(amount), 0) FROM finance_expenses WHERE spent_on BETWEEN ${from} AND ${to}) AS expenses,
         (SELECT COALESCE(SUM(due), 0) FROM finance_teacher_settlements WHERE period = ${period}) AS teacherDue,
         (SELECT COALESCE(SUM(amount), 0) FROM finance_unmatched WHERE status = 'open' AND received_on <= ${to}) AS unmatchedOpen`);

@@ -1,3 +1,4 @@
+import { getCommonLessons } from "../../controllers/admin/sessionCommonLessons";
 import { Router } from "express";
 import {
     selectCategory,
@@ -38,6 +39,7 @@ router.get("/select/teachers", requirePermission("sessions", "View"), catchAsync
 router.post("/teacher-states", requirePermission("sessions", "View"), catchAsync(getTeacherStatesForSchedule));
 router.get("/select/groups", requirePermission("sessions", "View"), catchAsync(selectGroups));
 router.post("/students/attendance", requirePermission("sessions", "View"), catchAsync(getStudentsCourseAttendance));
+router.post("/common-lessons", requirePermission("sessions", "View"), catchAsync(getCommonLessons));
 
 router.get("/cancelled", requirePermission("sessions", "View"), catchAsync(listCancelledSessions));
 router.get("/", requirePermission("sessions", "View"), catchAsync(getAllSessions));
