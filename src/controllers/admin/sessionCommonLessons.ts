@@ -1,8 +1,8 @@
 // controllers/admin/sessionCommonLessons.ts
 // Add session → the lessons a group (or several students) have IN COMMON, so the admin doesn't have to
 // pick a course / chapter first. A lesson is common when every student owns it (an active, unexpired
-// purchase of the lesson, its chapter, its semester or its course). Each lesson says how many of the
-// students already attended it.
+// purchase of the lesson, its chapter, its semester or its course). Only lessons that NONE of the
+// students attended yet are listed; the rest are counted in hiddenAttended.
 import { Request, Response } from "express";
 import { sql } from "drizzle-orm";
 import { db } from "../../models/connection";
@@ -43,7 +43,7 @@ export const getCommonLessons = async (req: Request, res: Response) => {
     const ownsNothing = students.filter((s) => !ownsSomething.has(s.id)).map((s) => s.name);
 
     if (!common.length) {
-        return SuccessResponse(res, { students: students.length, courses: [], ownsNothing });
+        return SuccessResponse(res, { students: students.length, courses: [], ownsNothing, sharedTotal: 0, hiddenAttended: 0 });
     }
 
     const lessonRows = await rows(sql`
@@ -65,15 +65,18 @@ export const getCommonLessons = async (req: Request, res: Response) => {
             WHERE status = 'present' AND student_id IN (${inList(studentIds)}) AND lesson_id IN (${inList(common)})
         ) x GROUP BY x.lessonId`);
     const attendedBy = new Map(attended.map((r) => [r.lessonId, Number(r.n) || 0]));
+    // only lessons NOBODY in the selection attended yet (attended by even one student → left out)
+    const hiddenAttended = lessonRows.filter((l) => attendedBy.get(l.id)).length;
 
     // course → chapter → lessons
     const courses: any[] = [];
     for (const l of lessonRows) {
+        if (attendedBy.get(l.id)) continue;
         let co = courses.find((c) => c.id === l.courseId);
         if (!co) courses.push(co = { id: l.courseId, name: l.courseName, categoryId: l.categoryId, subCategoryId: l.subCategoryId, chapters: [] });
         let ch = co.chapters.find((c: any) => c.id === l.chapterId);
         if (!ch) co.chapters.push(ch = { id: l.chapterId, name: l.chapterName, lessons: [] });
-        ch.lessons.push({ id: l.id, name: l.name, attended: attendedBy.get(l.id) || 0 });
+        ch.lessons.push({ id: l.id, name: l.name, attended: 0 });
     }
-    return SuccessResponse(res, { students: students.length, courses, ownsNothing });
+    return SuccessResponse(res, { students: students.length, courses, ownsNothing, sharedTotal: lessonRows.length, hiddenAttended });
 };
