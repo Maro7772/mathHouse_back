@@ -86,6 +86,7 @@ export const getAllAvailabilityPlans = async (req: Request, res: Response) => {
                 phone: Student.phone,
                 gradeId: Student.grade,
                 categoryId: Student.category,
+                plannerActive: Student.plannerActive,
             },
         })
         .from(studentAvailabilityPlans)

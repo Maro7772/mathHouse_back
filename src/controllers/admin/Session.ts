@@ -25,7 +25,7 @@ import { NotFound } from "../../Errors";
 import { validateAndSavePdf, deleteImage } from "../../utils/handleImages";
 import { resolveSessionMaterials, emptySessionMaterials } from "../../utils/sessionMaterials";
 import { generateMistakesPdfs } from "../../utils/mistakesGenerator";
-import { getLessonIdsBySession, markStudentPresent } from "../../utils/sessionAttendance";
+import { getLessonIdsBySession, markStudentPresent, refundSessionCharges } from "../../utils/sessionAttendance";
 
 // Selections
 export const selectCategory = async (req: Request, res: Response) => {
@@ -1423,7 +1423,10 @@ export const deleteSession = async (req: Request, res: Response) => {
         sessionIdsToDelete = relatedSessions.map(s => s.id);
     }
 
+    let refunded = 0;
     await db.transaction(async (tx) => {
+        // Give back live sessions already taken for these sessions (students who did not attend)
+        refunded = await refundSessionCharges(tx, sessionIdsToDelete);
         // Delete related entities for all targeted sessions first due to foreign key constraints
         await tx.delete(sessionUsers).where(inArray(sessionUsers.sessionId, sessionIdsToDelete));
         await tx.delete(sessionGroups).where(inArray(sessionGroups.sessionId, sessionIdsToDelete));
@@ -1436,7 +1439,7 @@ export const deleteSession = async (req: Request, res: Response) => {
     });
 
 
-    return SuccessResponse(res, { message: `Successfully deleted ${sessionIdsToDelete.length} session(s)` }, 200);
+    return SuccessResponse(res, { message: `Successfully deleted ${sessionIdsToDelete.length} session(s)`, sessionsGivenBack: refunded }, 200);
 };
 
 

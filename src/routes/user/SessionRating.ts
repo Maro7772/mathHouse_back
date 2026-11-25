@@ -4,6 +4,7 @@ import {
     getMySessionRatingBySessionId,
     getSessionRatingForm,
     submitSessionRatings,
+    getPendingSessionRatings,
 } from "../../controllers/user/SessionRating";
 import { catchAsync } from "../../utils/catchAsync";
 
@@ -11,6 +12,10 @@ const router = Router();
 
 // GET /api/user/session-ratings                      — all session ratings for logged-in student
 router.get("/", catchAsync(getMySessionRatings));
+
+// GET /api/user/session-ratings/pending              — attended sessions the student still has to rate
+// (must come before "/:sessionId")
+router.get("/pending", catchAsync(getPendingSessionRatings));
 
 // GET /api/user/session-ratings/:sessionId/form      — get rating form (questions + existing rating) for a session
 router.get("/:sessionId/form", catchAsync(getSessionRatingForm));

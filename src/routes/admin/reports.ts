@@ -6,7 +6,7 @@ import {
 } from "../../controllers/admin/reports";
 import {
     getStudentsReport, getCoursesReport, getTeachersReport, getTeacherReportDetail,
-    getRatesReport, getPaymentsReport, getHomeworkReport,
+    getRatesReport, getPaymentsReport, getHomeworkReport, getSessionsReport,
 } from "../../controllers/admin/reportPages";
 import { catchAsync } from "../../utils/catchAsync";
 import { requirePermission } from "../../middlewares/requirePermission";
@@ -19,6 +19,7 @@ router.get("/students", view, catchAsync(getStudentsReport));
 router.get("/courses", view, catchAsync(getCoursesReport));
 router.get("/teachers", view, catchAsync(getTeachersReport));
 router.get("/teachers/:teacherId", view, catchAsync(getTeacherReportDetail));
+router.get("/sessions", view, catchAsync(getSessionsReport));
 router.get("/rates", view, catchAsync(getRatesReport));
 router.get("/payments", view, catchAsync(getPaymentsReport));
 router.get("/homework", view, catchAsync(getHomeworkReport));

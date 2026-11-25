@@ -11,12 +11,18 @@ import {
     sessionStudentRatings,
     sessionStudentQuestionRatings
 } from "../../models/schema";
-import { eq, desc, inArray, and } from "drizzle-orm";
+import { eq, desc, inArray, and, sql } from "drizzle-orm";
 import { SuccessResponse } from "../../utils/response";
 import { NotFound } from "../../Errors/NotFound";
 import { BadRequest } from "../../Errors/BadRequest";
 import { v4 as uuidv4 } from "uuid";
 import { UnauthorizedError } from "../../Errors";
+import { cairoNow } from "../../utils/cairoTime";
+
+/** Shortest comment accepted with a session rating. */
+export const MIN_COMMENT = 10;
+/** Attended sessions older than this are not forced (only ones from the last N days). */
+const REQUIRED_DAYS = 14;
 
 const getStudentId = (req: Request): string => {
     const id = (req as any).user?.id;
@@ -153,10 +159,15 @@ export const submitSessionRatings = async (req: Request, res: Response) => {
 
     const session = await verifyStudentSessionAccess(sessionId, studentId);
 
-    const { ratings, generalComment } = req.body;
+    const { ratings } = req.body;
+    // A comment is required with every rating (it is what the teacher and admin read)
+    const generalComment = typeof req.body.generalComment === "string" ? req.body.generalComment.trim() : "";
 
     if (!Array.isArray(ratings) || ratings.length === 0) {
         throw new BadRequest("At least one question rating is required");
+    }
+    if (generalComment.length < MIN_COMMENT) {
+        throw new BadRequest(`Please write a comment about the session (at least ${MIN_COMMENT} characters)`);
     }
 
     // Fetch active rating questions to validate IDs and weights
@@ -392,4 +403,35 @@ export const getMySessionRatingBySessionId = async (req: Request, res: Response)
             questionRatings,
         }
     });
+};
+
+// ── SESSIONS THE STUDENT MUST STILL RATE ─────────────────────────
+// Every session the student was marked PRESENT in during the last 14 days and has not rated yet,
+// oldest first. The student site shows a rating window that can't be skipped until this list is empty.
+export const getPendingSessionRatings = async (req: Request, res: Response) => {
+    const studentId = getStudentId(req);
+    // no active questions → nothing can be submitted, so never force (it would lock the student out)
+    const [q] = await db.select({ id: sessionRatingQuestions.id }).from(sessionRatingQuestions).where(eq(sessionRatingQuestions.isActive, true)).limit(1);
+    if (!q) return SuccessResponse(res, { message: "Sessions waiting for your rating", data: { pending: [], minComment: MIN_COMMENT } });
+    const { stamp } = cairoNow();
+    const result: any = await db.execute(sql`
+        SELECT s.id AS sessionId, s.name AS sessionName,
+               DATE_FORMAT(COALESCE(s.session_date, s.start_date), '%Y-%m-%d') AS sessionDate,
+               TIME_FORMAT(s.time_from, '%H:%i') AS timeFrom, TIME_FORMAT(s.time_to, '%H:%i') AS timeTo,
+               t.name AS teacherName
+        FROM session_attendance a
+        JOIN sessions s ON s.id = a.session_id
+        LEFT JOIN teachers t ON t.id = s.teacher_id
+        WHERE a.student_id = ${studentId} AND a.status = 'present' AND s.status <> 'cancelled'
+          AND COALESCE(s.session_date, s.start_date) >= DATE_SUB(${stamp.slice(0, 10)}, INTERVAL ${REQUIRED_DAYS} DAY)
+          -- only once the class is over (Join marks present at the start)
+          AND CONCAT(DATE_FORMAT(COALESCE(s.session_date, s.start_date), '%Y-%m-%d'), ' ', TIME_FORMAT(s.time_to, '%H:%i:%s')) <= ${stamp}
+          -- only sessions the rating form will open for (booked by name or through a group)
+          AND (EXISTS (SELECT 1 FROM session_users su WHERE su.session_id = s.id AND su.student_id = ${studentId})
+               OR EXISTS (SELECT 1 FROM session_groups sg JOIN group_students gs ON gs.group_id = sg.group_id
+                          WHERE sg.session_id = s.id AND gs.student_id = ${studentId}))
+          AND NOT EXISTS (SELECT 1 FROM session_student_ratings r WHERE r.session_id = s.id AND r.student_id = ${studentId})
+        ORDER BY COALESCE(s.session_date, s.start_date), s.time_from`);
+    const pending = (Array.isArray(result) ? result[0] : result?.rows) ?? [];
+    SuccessResponse(res, { message: "Sessions waiting for your rating", data: { pending, minComment: MIN_COMMENT } });
 };

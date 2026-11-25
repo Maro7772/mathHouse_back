@@ -3,7 +3,7 @@ import { catchAsync } from "../../utils/catchAsync";
 import { requirePermission } from "../../middlewares/requirePermission";
 import { validate } from "../../middlewares/validation";
 import {
-    getTimetable, getFreeAt, getPlannerOptions, getCourseLessons, createPlannerSession, buildPlan, approvePlanSession, dispatchSessions, getPlanBudget, getPlanGroupSessions } from "../../controllers/admin/planner";
+    getTimetable, getFreeAt, getPlannerOptions, getCourseLessons, createPlannerSession, buildPlan, approvePlanSession, dispatchSessions, getPlanBudget, getPlanGroupSessions, getWaitingStudents, setStudentPlannerActive } from "../../controllers/admin/planner";
 import {
     plannerCreateSessionSchema, plannerBuildPlanSchema, plannerDispatchSchema,
 } from "../../validation/admin/planner";
@@ -11,6 +11,8 @@ import {
 // Admin → Live → Planner. Mounted at /admin/planner.
 const router = Router();
 
+router.get("/waiting", requirePermission("availability_plans", "View"), catchAsync(getWaitingStudents));
+router.put("/students/:id/active", requirePermission("availability_plans", "Edit"), catchAsync(setStudentPlannerActive));
 router.get("/timetable", requirePermission("sessions", "View"), catchAsync(getTimetable));
 router.get("/options", requirePermission("sessions", "View"), catchAsync(getPlannerOptions));
 router.get("/courses/:courseId/lessons", requirePermission("sessions", "View"), catchAsync(getCourseLessons));

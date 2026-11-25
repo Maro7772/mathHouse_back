@@ -219,7 +219,7 @@ async function fetchSessionRatings(sessionIds: string[]) {
  * Lightweight student list (direct + via groups) with attendance status, grouped by sessionId.
  */
 async function fetchSessionStudentsLite(sessionIds: string[]) {
-    const bySession = new Map<string, { id: string; name: string; avatar: string | null; attendance: string; chargeStatus: string | null }[]>();
+    const bySession = new Map<string, { id: string; name: string; avatar: string | null; attendance: string; chargeStatus: string | null; liveBalance: number }[]>();
     if (sessionIds.length === 0) return bySession;
 
     const [directRows, groupRows, attendanceRows] = await Promise.all([
@@ -244,7 +244,7 @@ async function fetchSessionStudentsLite(sessionIds: string[]) {
     if (allStudentIds.length === 0) return bySession;
 
     const studentRows = await db
-        .select({ id: Student.id, firstname: Student.firstname, lastname: Student.lastname, avatar: Student.avatar })
+        .select({ id: Student.id, firstname: Student.firstname, lastname: Student.lastname, avatar: Student.avatar, liveBalance: Student.livebalance })
         .from(Student)
         .where(inArray(Student.id, allStudentIds));
     const studentMap = new Map(studentRows.map(st => [st.id, st]));
@@ -253,7 +253,7 @@ async function fetchSessionStudentsLite(sessionIds: string[]) {
     const chargeMap = await getChargeStatuses(sessionIds);
 
     idsBySession.forEach((ids, sessionId) => {
-        const list: { id: string; name: string; avatar: string | null; attendance: string; chargeStatus: string | null }[] = [];
+        const list: { id: string; name: string; avatar: string | null; attendance: string; chargeStatus: string | null; liveBalance: number }[] = [];
         ids.forEach(studentId => {
             const st = studentMap.get(studentId);
             if (!st) return;
@@ -263,6 +263,8 @@ async function fetchSessionStudentsLite(sessionIds: string[]) {
                 avatar: st.avatar,
                 attendance: attendanceMap.get(`${sessionId}:${studentId}`) ?? "not_marked",
                 chargeStatus: chargeMap.get(`${sessionId}:${studentId}`) ?? null,
+                // live sessions left — the attendance window warns before marking a student with 0
+                liveBalance: Number(st.liveBalance ?? 0),
             });
         });
         bySession.set(sessionId, list);

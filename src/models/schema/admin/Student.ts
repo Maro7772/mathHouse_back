@@ -19,6 +19,8 @@ export const Student = mysqlTable("student", {
     livebalance: int("live_balance").notNull().default(0),
     exambalance: int("exam_balance").notNull().default(0),
     questionbalance: int("question_balance").notNull().default(0),
+    // Planner follow-up: Inactive students don't raise "waiting for approval" alerts for admin
+    plannerActive: boolean("planner_active").notNull().default(true),
     
     avatar:varchar("avatar",{length:255}),
 })

@@ -2,6 +2,7 @@
 import { assertTeacherFree, ymd } from "../../utils/teacherSchedule";
 import { Moved, sessionsToMove, assertCanReassign, applyReassign, notifyReassign, studentsOfSession } from "../../utils/sessionReassign";
 import { sendStudentNotification } from "../../utils/studentNotification";
+import { refundSessionCharges } from "../../utils/sessionAttendance";
 // Admin side of the teacher portal: answer cover / cancellation requests,
 // read a teacher's weekly availability, cancel or restore sessions.
 import { Request, Response } from "express";
@@ -120,13 +121,17 @@ export const respondToTeacherRequest = async (req: Request, res: Response) => {
         if (status !== "accepted") return;
 
         if (request.type === "cancellation" && request.sessionId && !coverTeacherId) {
-            await tx.update(sessions).set({
+            const [upd] = await tx.update(sessions).set({
                 status: "cancelled",
                 cancelReason: request.reason,
                 cancelledBy: "teacher",
                 cancelledAt: new Date(),
-            }).where(eq(sessions.id, request.sessionId));
-            cancelled = true;
+            }).where(and(eq(sessions.id, request.sessionId), sql`${sessions.status} <> 'cancelled'`));
+            // students were told "you won't be charged" — give back a session the 24h job already took
+            if (Number((upd as any)?.affectedRows ?? 0)) {
+                await refundSessionCharges(tx, [request.sessionId]);
+                cancelled = true;
+            }
         }
         if (moved.length && coverTeacherId) await applyReassign(tx, moved, coverTeacherId);
     });
@@ -166,9 +171,16 @@ export const cancelSession = async (req: Request, res: Response) => {
     if (!session) throw new NotFound("Session not found");
     if (session.status === "cancelled") throw new BadRequest("Session is already cancelled");
 
-    await db.update(sessions).set({
-        status: "cancelled", cancelReason: req.body.reason, cancelledBy: "admin", cancelledAt: new Date(),
-    }).where(eq(sessions.id, session.id));
+    let refunded = 0;
+    await db.transaction(async (tx) => {
+        // only the first cancel counts (a double click / two admins can't refund twice)
+        const [upd] = await tx.update(sessions).set({
+            status: "cancelled", cancelReason: req.body.reason, cancelledBy: "admin", cancelledAt: new Date(),
+        }).where(and(eq(sessions.id, session.id), sql`${sessions.status} <> 'cancelled'`));
+        if (!Number((upd as any)?.affectedRows ?? 0)) throw new BadRequest("Session is already cancelled");
+        // students are told "you won't be charged" — give back a session the 24h job already took
+        refunded = await refundSessionCharges(tx, [session.id]);
+    });
 
     // tell the students and the teacher (the admin screen already promised this)
     const text = `"${session.name}" on ${ymd(session.date)} ${fmtTime(session.from)} was cancelled${req.body.reason ? ` — ${req.body.reason}` : ""}.`;
@@ -177,7 +189,7 @@ export const cancelSession = async (req: Request, res: Response) => {
         try { await sendStudentNotification(studentId, `${text} You won't be charged for it.`); } catch { /* not critical */ }
     }
     if (session.teacherId) { try { await notifyTeacher(session.teacherId, text); } catch { /* not critical */ } }
-    return SuccessResponse(res, { message: "Session cancelled", studentsNotified: students.length });
+    return SuccessResponse(res, { message: "Session cancelled", studentsNotified: students.length, sessionsGivenBack: refunded });
 };
 
 /** PATCH /admin/session/:id/restore */

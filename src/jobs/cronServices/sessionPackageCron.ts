@@ -14,28 +14,9 @@ import { Student } from "../../models/schema/admin/Student";
 import { studentCancelRequests } from "../../models/schema/admin/studentPortal";
 import { eq, and, inArray, sql } from "drizzle-orm";
 
-/**
- * Returns Cairo local date and time parts.
- */
-export const cairoNow = () => {
-    const parts = new Intl.DateTimeFormat("en-CA", {
-        timeZone: "Africa/Cairo",
-        hour12: false,
-        year: "numeric",
-        month: "2-digit",
-        day: "2-digit",
-        hour: "2-digit",
-        minute: "2-digit",
-        second: "2-digit",
-    }).formatToParts(new Date());
-    const p = Object.fromEntries(parts.map(x => [x.type, x.value]));
-    const hour = p.hour === "24" ? "00" : p.hour;
-    return {
-        today: `${p.year}-${p.month}-${p.day}`,
-        currentTime: `${hour}:${p.minute}:${p.second}`,
-        cairoDate: new Date(`${p.year}-${p.month}-${p.day}T${hour}:${p.minute}:${p.second}`),
-    };
-};
+// Cairo date / time (shared helper; re-exported here for existing imports)
+export { cairoNow } from "../../utils/cairoTime";
+import { cairoNow } from "../../utils/cairoTime";
 
 /**
  * Deducts 1 session from a single student's live balance for a given session,
@@ -106,7 +87,9 @@ export async function deductSingleStudentSession(
         const [result] = await db
             .update(Student)
             .set({ livebalance: sql`${Student.livebalance} - 1` })
-            .where(and(eq(Student.id, studentId), sql`${Student.livebalance} > 0`));
+            // re-check the session: it may have been cancelled after this run loaded it
+            .where(and(eq(Student.id, studentId), sql`${Student.livebalance} > 0`,
+                sql`EXISTS (SELECT 1 FROM sessions WHERE id = ${sessionId} AND status <> 'cancelled')`));
 
         const affected = (result as any)?.affectedRows ?? 0;
         if (affected > 0) {

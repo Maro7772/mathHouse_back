@@ -12,6 +12,7 @@ import { requirePermission } from "../../middlewares/requirePermission";
 import { getStudentNotes } from "../../controllers/admin/notes";
 import { getStudentsReport } from "../../controllers/admin/reportPages";
 import { getLessonAttendance, saveLessonAttendance } from "../../controllers/admin/lessonAttendance";
+import { giveFreeSessions, listFreeSessions } from "../../controllers/admin/freeSessions";
 
 const router = Router();
 
@@ -27,6 +28,9 @@ router.get("/:id/open-account",    validate(idParamsSchema, "params"), requirePe
 router.get("/:id/payment-history", validate(idParamsSchema, "params"), requirePermission("students", "View"),  catchAsync(getPaymentHistory));
 router.get("/:id/content",         validate(idParamsSchema, "params"), requirePermission("students", "View"),  catchAsync(getStudentContent));
 router.get("/:id/packages",        validate(idParamsSchema, "params"), requirePermission("students", "View"),  catchAsync(getStudentPackages));
+// Free live sessions admin gives, with a reason (added to the live balance; reports show them as free)
+router.get("/:id/free-sessions",  validate(idParamsSchema, "params"), requirePermission("students", "View"), catchAsync(listFreeSessions));
+router.post("/:id/free-sessions", validate(idParamsSchema, "params"), requirePermission("students", "Edit"), catchAsync(giveFreeSessions));
 router.get("/:id/lesson-attendance", validate(idParamsSchema, "params"), requirePermission("students", "View"), catchAsync(getLessonAttendance));
 router.get("/:id/notes", validate(idParamsSchema, "params"), requirePermission("students", "View"),  catchAsync(getStudentNotes));
 

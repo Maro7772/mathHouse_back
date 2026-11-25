@@ -4,7 +4,8 @@
 import { randomUUID } from "crypto";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { db } from "../models/connection";
-import { sessionAttendance, sessionLessons, sessionPackageDeductions, sessionUsers } from "../models/schema/admin/Session";
+import { sessionAttendance, sessionLessons, sessionPackageDeductions, sessionUsers, sessions } from "../models/schema/admin/Session";
+import { cairoNow } from "./cairoTime";
 import { Student } from "../models/schema/admin/Student";
 import { enrolledItems } from "../models/schema/user/enrolledItems";
 import { BadRequest } from "../Errors";
@@ -201,4 +202,47 @@ export async function getChargeStatuses(sessionIds: string[]) {
         .where(inArray(sessionPackageDeductions.sessionId, sessionIds));
     for (const r of rows) map.set(`${r.sessionId}:${r.studentId}`, r.chargeStatus as ChargeStatus);
     return map;
+}
+
+/**
+ * Gives back the live sessions taken for sessions that will not happen (cancelled or deleted).
+ * Only sessions that have NOT ended yet (Cairo time) are touched — a past class keeps its charges,
+ * so deleting an old series or cancelling a held session never refunds no-shows.
+ * For each charge of those sessions whose student was NOT marked present: the charge row is removed and,
+ * only if this call really removed it and a session was really taken ("paid"), 1 goes back to the balance
+ * (two cancels at once can't refund twice). Returns how many sessions were given back.
+ */
+export async function refundSessionCharges(tx: Tx, sessionIds: string[]): Promise<number> {
+    if (!sessionIds.length) return 0;
+    const { stamp } = cairoNow();
+    const notEnded = await tx
+        .select({ id: sessions.id })
+        .from(sessions)
+        .where(and(
+            inArray(sessions.id, sessionIds),
+            sql`CONCAT(DATE_FORMAT(COALESCE(${sessions.sessionDate}, ${sessions.startDate}), '%Y-%m-%d'), ' ', TIME_FORMAT(${sessions.timeTo}, '%H:%i:%s')) > ${stamp}`,
+        ));
+    const ids = notEnded.map((s) => s.id);
+    if (!ids.length) return 0;
+    const charges = await tx
+        .select({ id: sessionPackageDeductions.id, sessionId: sessionPackageDeductions.sessionId, studentId: sessionPackageDeductions.studentId, chargeStatus: sessionPackageDeductions.chargeStatus })
+        .from(sessionPackageDeductions)
+        .where(inArray(sessionPackageDeductions.sessionId, ids));
+    if (!charges.length) return 0;
+    const present = await tx
+        .select({ sessionId: sessionAttendance.sessionId, studentId: sessionAttendance.studentId })
+        .from(sessionAttendance)
+        .where(and(inArray(sessionAttendance.sessionId, ids), eq(sessionAttendance.status, "present")));
+    const came = new Set(present.map((p) => `${p.sessionId}|${p.studentId}`));
+    let refunded = 0;
+    for (const c of charges) {
+        if (came.has(`${c.sessionId}|${c.studentId}`)) continue;
+        const [del] = await tx.delete(sessionPackageDeductions).where(eq(sessionPackageDeductions.id, c.id));
+        const removed = Number((del as any)?.affectedRows ?? 0) > 0;
+        if (removed && c.chargeStatus === "paid") {
+            await tx.update(Student).set({ livebalance: sql`${Student.livebalance} + 1` }).where(eq(Student.id, c.studentId));
+            refunded++;
+        }
+    }
+    return refunded;
 }

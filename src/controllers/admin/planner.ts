@@ -20,9 +20,10 @@ import { BadRequest, NotFound } from "../../Errors";
 import { sendStudentNotification } from "../../utils/studentNotification";
 import { notifyTeacher } from "../teacher/portal";
 import { sessionHasNobody } from "../../utils/sessionVisibility";
-import { assertTeacherFree } from "../../utils/teacherSchedule";
+import { assertTeacherFree, ymd } from "../../utils/teacherSchedule";
 import { studentSessionBudget, studentLessonStatus } from "../../utils/studentPlanning";
 import { matchGroupSessions } from "../../utils/groupMatching";
+import { cairoNow } from "../../utils/cairoTime";
 
 type Row = Record<string, any>;
 const rows = async (q: SQL): Promise<Row[]> => {
@@ -442,7 +443,7 @@ export const approvePlanSession = async (req: Request, res: Response) => {
         }
     }
     for (const l of links) {
-        await sendStudentNotification(l.studentId, `The admin confirmed "${session?.name}" on ${pretty(String(session?.date).slice(0, 10), String(session?.timeFrom))} for your plan "${l.title}".`);
+        await sendStudentNotification(l.studentId, `The admin confirmed "${session?.name}" on ${pretty(ymd(session?.date), String(session?.timeFrom))} for your plan "${l.title}".`);
     }
     return SuccessResponse(res, { message: "Session approved — the student was added and told" });
 };
@@ -527,4 +528,55 @@ export const getCourseLessons = async (req: Request, res: Response) => {
         ch.lessons.push({ id: r.id, name: r.name, ...(studentId ? { status: lessonStatus.get(r.id) || null } : {}) });
     });
     return SuccessResponse(res, { chapters });
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /admin/planner/waiting?date=YYYY-MM-DD (default today)
+// Students whose free times are still waiting for admin (pending_admin_review) and who are free on that
+// day (a weekly slot on that weekday, or a slot on that exact date). Inactive students are only counted.
+// ─────────────────────────────────────────────────────────────────────────────
+const WEEKDAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+export const getWaitingStudents = async (req: Request, res: Response) => {
+    const today = cairoNow().today; // business day in Cairo, whatever the server's time zone
+    const date = typeof req.query.date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(req.query.date) ? req.query.date : today;
+    const weekday = WEEKDAYS[new Date(`${date}T12:00:00`).getDay()];
+
+    const list = await rows(sql`
+        SELECT p.id AS planId, p.title, p.created_at AS sentAt, p.proposed_at AS proposedAt,
+               st.id AS studentId, CONCAT(st.first_name, ' ', st.last_name) AS name, st.nickname, st.planner_active AS active,
+               TIME_FORMAT(sl.time_from, '%H:%i') AS timeFrom, TIME_FORMAT(sl.time_to, '%H:%i') AS timeTo
+        FROM student_availability_plans p
+        JOIN student st ON st.id = p.student_id
+        JOIN student_availability_slots sl ON sl.plan_id = p.id
+        WHERE p.status = 'pending_admin_review'
+          AND (sl.specific_date = ${date} OR (sl.specific_date IS NULL AND sl.day_of_week = ${weekday}))
+        ORDER BY p.created_at, sl.time_from`);
+
+    const byPlan = new Map<string, any>();
+    list.forEach((r) => {
+        const p = byPlan.get(r.planId) || {
+            planId: r.planId, title: r.title, sentAt: r.sentAt, declinedBefore: Boolean(r.proposedAt),
+            studentId: r.studentId, name: String(r.name || "").trim(), nickname: r.nickname, active: Boolean(Number(r.active)), times: [] as string[],
+        };
+        const t = `${r.timeFrom}–${r.timeTo}`;
+        if (!p.times.includes(t)) p.times.push(t);
+        byPlan.set(r.planId, p);
+    });
+    const all = [...byPlan.values()];
+    return SuccessResponse(res, {
+        date, weekday,
+        waiting: all.filter((p) => p.active),
+        inactive: all.filter((p) => !p.active).length,
+    });
+};
+
+// PUT /admin/planner/students/:id/active { active: boolean } — Active / Inactive for planner alerts
+export const setStudentPlannerActive = async (req: Request, res: Response) => {
+    const id = String(req.params.id || "");
+    const active = req.body?.active;
+    if (typeof active !== "boolean") throw new BadRequest("active must be true or false");
+    const [st] = await rows(sql`SELECT id FROM student WHERE id = ${id}`);
+    if (!st) throw new NotFound("Student not found");
+    await db.execute(sql`UPDATE student SET planner_active = ${active ? 1 : 0} WHERE id = ${id}`);
+    return SuccessResponse(res, { message: active ? "Student is active — you'll get planner alerts" : "Student is inactive — no planner alerts", active });
 };

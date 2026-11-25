@@ -4,6 +4,7 @@ import { db } from "../../models/connection";
 import { SuccessResponse } from "../../utils/response";
 import { BadRequest } from "../../Errors/BadRequest";
 import { NotFound } from "../../Errors/NotFound";
+import { cairoNow } from "../../utils/cairoTime";
 
 /*
  * Admin → Reports pages (MathPortal design): Students, Courses, Teachers, Rates, Payments, Extra H.W.
@@ -196,6 +197,138 @@ export const getCoursesReport = async (_req: Request, res: Response) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Teacher money: what each live session a teacher gave was worth.
+//
+// A student buys live packages (N sessions for X EGP, any method incl. wallet). Each session he is
+// charged for (session_package_deductions 'paid') uses one session of his balance. The sessions he
+// paid for are used first, in date order, at his average paid price (total paid ÷ sessions bought).
+// Anything beyond what he paid for came from balance admin gave him free (a 0 EGP package, or the
+// balance set by hand). Re-Explanations of attended lessons are 'free', presence with an empty
+// balance is 'unpaid', and present without any charge row is "not charged" — all three earn nothing.
+// ─────────────────────────────────────────────────────────────────────────────
+type StudentMoney = { paid: number; bought: number; price: number | null; gifted: number };
+type ChargeRow = { teacherId: string; studentId: string; sessionId: string; day: string; kind: "bought" | "gift" | "free" | "unpaid" | "uncharged" };
+
+const DEDUCTION_JOIN = sql.raw(`d.session_id COLLATE utf8mb4_general_ci = s.id COLLATE utf8mb4_general_ci`);
+
+async function liveMoney(): Promise<Map<string, StudentMoney>> {
+    const r = await rows(sql`
+        SELECT p.studentId, SUM(CASE WHEN p.amount > 0 THEN p.amount ELSE 0 END) AS paid,
+               SUM(CASE WHEN p.amount > 0 THEN pk.number ELSE 0 END) AS bought,
+               SUM(CASE WHEN p.amount > 0 THEN 0 ELSE pk.number END) AS gifted
+        FROM payment p JOIN packages pk ON pk.id = p.packageId
+        WHERE pk.type = 'live' AND p.status = 'completed' AND p.isDeleted = 0 AND p.studentId IS NOT NULL
+        GROUP BY p.studentId`);
+    return new Map(r.map((x) => {
+        const paid = num(x.paid), bought = num(x.bought);
+        return [x.studentId, { paid, bought, gifted: num(x.gifted), price: bought ? paid / bought : null }];
+    }));
+}
+
+/** Every charge (and uncharged presence) of the given teacher — or of all teachers — tagged with its kind. */
+async function liveCharges(money: Map<string, StudentMoney>, teacherId?: string): Promise<ChargeRow[]> {
+    // the "bought first" order needs ALL of a student's paid charges, whoever the teacher was
+    const paidAll = await rows(sql`
+        SELECT d.student_id AS studentId, d.session_id AS sessionId, s.teacher_id AS teacherId,
+               DATE_FORMAT(${SESSION_DAY}, '%Y-%m-%d') AS day, s.status AS status
+        FROM session_package_deductions d JOIN sessions s ON ${DEDUCTION_JOIN}
+        WHERE d.charge_status = 'paid'
+        ORDER BY d.student_id, ${SESSION_DAY}, s.time_from, d.deducted_at`);
+    const out: ChargeRow[] = [];
+    const used = new Map<string, number>();
+    for (const c of paidAll) {
+        const n = (used.get(c.studentId) || 0) + 1;
+        used.set(c.studentId, n);
+        if (teacherId && c.teacherId !== teacherId) continue;
+        // a charge left on a cancelled session (from before cancels gave sessions back) used balance,
+        // so it counts in the order above, but the teacher earns nothing for a class that didn't happen
+        if (c.status === "cancelled") continue;
+        const { status: _s, ...row } = c;
+        out.push({ ...row, kind: n <= (money.get(c.studentId)?.bought || 0) ? "bought" : "gift" } as ChargeRow);
+    }
+    const byTeacher = teacherId ? sql`AND s.teacher_id = ${teacherId}` : sql``;
+    const other = await rows(sql`
+        SELECT d.student_id AS studentId, d.session_id AS sessionId, s.teacher_id AS teacherId,
+               DATE_FORMAT(${SESSION_DAY}, '%Y-%m-%d') AS day, d.charge_status AS kind
+        FROM session_package_deductions d JOIN sessions s ON ${DEDUCTION_JOIN}
+        WHERE d.charge_status IN ('free', 'unpaid') AND s.status <> 'cancelled' ${byTeacher}`);
+    const uncharged = await rows(sql`
+        SELECT a.student_id AS studentId, a.session_id AS sessionId, s.teacher_id AS teacherId,
+               DATE_FORMAT(${SESSION_DAY}, '%Y-%m-%d') AS day, 'uncharged' AS kind
+        FROM session_attendance a JOIN sessions s ON s.id = a.session_id
+        WHERE a.status = 'present' AND s.status <> 'cancelled' ${byTeacher}
+          AND NOT EXISTS (SELECT 1 FROM session_package_deductions d
+                          WHERE d.session_id COLLATE utf8mb4_general_ci = a.session_id COLLATE utf8mb4_general_ci
+                            AND d.student_id COLLATE utf8mb4_general_ci = a.student_id COLLATE utf8mb4_general_ci)`);
+    return [...out, ...(other as ChargeRow[]), ...(uncharged as ChargeRow[])];
+}
+
+const worth = (c: ChargeRow, money: Map<string, StudentMoney>) =>
+    c.kind === "bought" ? money.get(c.studentId)?.price || 0 : 0;
+
+/** The period of the same length right before from–to (for "vs previous period"). */
+function previousRange(from: string, to: string) {
+    const day = 86400000;
+    const f = new Date(`${from}T00:00:00Z`).getTime(), t = new Date(`${to}T00:00:00Z`).getTime();
+    const len = Math.round((t - f) / day) + 1;
+    const iso = (ms: number) => new Date(ms).toISOString().slice(0, 10);
+    return { from: iso(f - len * day), to: iso(f - day) };
+}
+
+/** One line per session: who was booked, who came, what it earned. `where` filters `sessions s`. */
+async function sessionLines(where: SQL, money: Map<string, StudentMoney>, charges: ChargeRow[]) {
+    const list = await rows(sql`
+        SELECT s.id, s.name, DATE_FORMAT(${SESSION_DAY}, '%Y-%m-%d') AS day,
+               TIME_FORMAT(s.time_from, '%H:%i') AS timeFrom, TIME_FORMAT(s.time_to, '%H:%i') AS timeTo,
+               s.session_relational_type AS type, s.status, s.cancel_reason AS cancelReason,
+               s.teacher_id AS teacherId, t.name AS teacherName
+        FROM sessions s LEFT JOIN teachers t ON t.id = s.teacher_id
+        WHERE ${where}
+        ORDER BY ${SESSION_DAY} DESC, s.time_from DESC`);
+    if (!list.length) return [];
+    const booked = await rows(sql`
+        SELECT x.sessionId, COUNT(DISTINCT x.studentId) AS n FROM (
+            SELECT su.session_id AS sessionId, su.student_id AS studentId FROM session_users su
+            UNION
+            SELECT sg.session_id, gs.student_id FROM session_groups sg JOIN group_students gs ON gs.group_id = sg.group_id
+        ) x JOIN sessions s ON s.id = x.sessionId WHERE ${where} GROUP BY x.sessionId`);
+    const att = await rows(sql`
+        SELECT a.session_id AS sessionId, SUM(a.status = 'present') AS present, SUM(a.status = 'absent') AS absent
+        FROM session_attendance a JOIN sessions s ON s.id = a.session_id WHERE ${where} GROUP BY a.session_id`);
+    const rate = await rows(sql`
+        SELECT r.session_id AS sessionId, AVG(r.overall_rating) AS avgRating, COUNT(*) AS ratings
+        FROM session_student_ratings r JOIN sessions s ON s.id = r.session_id WHERE ${where} GROUP BY r.session_id`);
+    const B = new Map(booked.map((r) => [r.sessionId, num(r.n)]));
+    const A = new Map(att.map((r) => [r.sessionId, r]));
+    const R = new Map(rate.map((r) => [r.sessionId, r]));
+    const M = new Map<string, { revenue: number; paid: number; free: number }>();
+    charges.forEach((c) => {
+        const m = M.get(c.sessionId) || { revenue: 0, paid: 0, free: 0 };
+        if (c.kind === "bought") { m.paid++; m.revenue += worth(c, money); } else m.free++;
+        M.set(c.sessionId, m);
+    });
+    const today = cairoNow().today;
+    return list.map((x) => {
+        const a = A.get(x.id), m = M.get(x.id), present = num(a?.present), absent = num(a?.absent);
+        const bookedN = Math.max(B.get(x.id) || 0, present + absent);
+        return {
+            id: x.id, name: x.name, day: x.day, timeFrom: x.timeFrom, timeTo: x.timeTo, type: x.type,
+            teacherId: x.teacherId, teacherName: x.teacherName ?? null, cancelReason: x.cancelReason ?? null,
+            // held = scheduled and the day has passed (or is today with attendance taken)
+            state: x.status === "cancelled" ? "cancelled" : x.day > today ? "upcoming" : x.day === today && !(present + absent) ? "today" : "held",
+            booked: bookedN, present, absent,
+            notMarked: x.status === "cancelled" ? 0 : Math.max(0, bookedN - present - absent),
+            attendanceRate: present + absent ? Math.round((present / (present + absent)) * 100) : null,
+            paidStudents: m?.paid || 0,
+            freeStudents: m?.free || 0,
+            revenue: Math.round(m?.revenue || 0),
+            avgRating: round1(R.get(x.id)?.avgRating),
+            ratings: num(R.get(x.id)?.ratings),
+        };
+    });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // GET /admin/reports/teachers?from&to
 // ─────────────────────────────────────────────────────────────────────────────
 export const getTeachersReport = async (req: Request, res: Response) => {
@@ -221,6 +354,16 @@ export const getTeachersReport = async (req: Request, res: Response) => {
              WHERE s.teacher_id = t.id) AS ratings
         FROM teachers t`);
 
+    // money earned in the period (session day inside from–to)
+    const money = await liveMoney();
+    const charges = (await liveCharges(money)).filter((c) => c.day >= from && c.day <= to);
+    const earn = new Map<string, { revenue: number; paidSessions: number; freeSessions: number }>();
+    charges.forEach((c) => {
+        const e = earn.get(c.teacherId) || { revenue: 0, paidSessions: 0, freeSessions: 0 };
+        if (c.kind === "bought") { e.paidSessions++; e.revenue += worth(c, money); } else e.freeSessions++;
+        earn.set(c.teacherId, e);
+    });
+
     const out = list.map((t) => ({
         id: t.id,
         name: t.name,
@@ -233,9 +376,32 @@ export const getTeachersReport = async (req: Request, res: Response) => {
         attendanceRate: num(t.marked) ? Math.round((num(t.present) / num(t.marked)) * 100) : null,
         avgRating: round1(t.avgRating),
         ratings: num(t.ratings),
+        revenue: Math.round(earn.get(t.id)?.revenue || 0),
+        paidSessions: earn.get(t.id)?.paidSessions || 0,   // student-sessions paid with money
+        freeSessions: earn.get(t.id)?.freeSessions || 0,   // student-sessions given free
     })).sort((a, b) => b.sessions - a.sessions || a.name.localeCompare(b.name));
 
-    return SuccessResponse(res, { from, to, teachers: out });
+    // previous period of the same length, for growth
+    const prev = previousRange(from, to);
+    const [prevS] = await rows(sql`SELECT COUNT(*) AS n FROM sessions s WHERE s.status = 'scheduled' AND ${SESSION_DAY} BETWEEN ${prev.from} AND ${prev.to}`);
+    const prevCharges = (await liveCharges(money)).filter((c) => c.day >= prev.from && c.day <= prev.to);
+    const [att] = await rows(sql`
+        SELECT SUM(a.status = 'present') AS present FROM session_attendance a JOIN sessions s ON s.id = a.session_id
+        WHERE ${SESSION_DAY} BETWEEN ${from} AND ${to}`);
+    const [prevAtt] = await rows(sql`
+        SELECT SUM(a.status = 'present') AS present FROM session_attendance a JOIN sessions s ON s.id = a.session_id
+        WHERE ${SESSION_DAY} BETWEEN ${prev.from} AND ${prev.to}`);
+
+    return SuccessResponse(res, {
+        from, to, teachers: out,
+        totals: { sessions: out.reduce((n, t) => n + t.sessions, 0), revenue: out.reduce((n, t) => n + t.revenue, 0), attendances: num(att?.present) },
+        previous: {
+            from: prev.from, to: prev.to,
+            sessions: num(prevS?.n),
+            revenue: Math.round(prevCharges.reduce((n, c) => n + worth(c, money), 0)),
+            attendances: num(prevAtt?.present),
+        },
+    });
 };
 
 // GET /admin/reports/teachers/:teacherId — past sessions + ratings with comments
@@ -244,16 +410,6 @@ export const getTeacherReportDetail = async (req: Request, res: Response) => {
     const [teacher] = await rows(sql`SELECT id, name, email FROM teachers WHERE id = ${teacherId}`);
     if (!teacher) throw new NotFound("Teacher not found");
 
-    const sessionsList = await rows(sql`
-        SELECT s.id, s.name, ${SESSION_DAY} AS day, s.time_from AS timeFrom, s.time_to AS timeTo,
-               s.session_relational_type AS type, s.status, s.cancel_reason AS cancelReason,
-               (SELECT COUNT(*) FROM session_attendance a WHERE a.session_id = s.id AND a.status = 'present') AS present,
-               (SELECT COUNT(*) FROM session_attendance a WHERE a.session_id = s.id) AS marked,
-               (SELECT AVG(r.overall_rating) FROM session_student_ratings r WHERE r.session_id = s.id) AS avgRating
-        FROM sessions s
-        WHERE s.teacher_id = ${teacherId} AND ${SESSION_DAY} <= CURDATE()
-        ORDER BY ${SESSION_DAY} DESC, s.time_from DESC
-        LIMIT 40`);
 
     const reviews = await rows(sql`
         SELECT r.id, r.overall_rating AS rating, r.general_comment AS comment, r.created_at AS createdAt,
@@ -265,10 +421,150 @@ export const getTeacherReportDetail = async (req: Request, res: Response) => {
         ORDER BY r.created_at DESC
         LIMIT 30`);
 
+    // ── students across ALL of the teacher's sessions (booked by name, through a group, or marked) ──
+    const audience = await rows(sql`
+        SELECT x.studentId, COUNT(DISTINCT x.sessionId) AS booked FROM (
+            SELECT su.student_id AS studentId, s.id AS sessionId FROM session_users su JOIN sessions s ON s.id = su.session_id
+              WHERE s.teacher_id = ${teacherId} AND s.status = 'scheduled'
+            UNION
+            SELECT gs.student_id, s.id FROM session_groups sg JOIN group_students gs ON gs.group_id = sg.group_id
+              JOIN sessions s ON s.id = sg.session_id WHERE s.teacher_id = ${teacherId} AND s.status = 'scheduled'
+            UNION
+            SELECT a.student_id, s.id FROM session_attendance a JOIN sessions s ON s.id = a.session_id
+              WHERE s.teacher_id = ${teacherId}
+        ) x GROUP BY x.studentId`);
+    const attendance = await rows(sql`
+        SELECT a.student_id AS studentId, SUM(a.status = 'present') AS present, SUM(a.status = 'absent') AS absent,
+               MAX(CASE WHEN a.status = 'present' THEN DATE_FORMAT(${SESSION_DAY}, '%Y-%m-%d') END) AS lastAttended
+        FROM session_attendance a JOIN sessions s ON s.id = a.session_id
+        WHERE s.teacher_id = ${teacherId} GROUP BY a.student_id`);
+    const ids = audience.map((a) => a.studentId);
+    const people = ids.length ? await rows(sql`
+        SELECT st.id, CONCAT(st.first_name, ' ', st.last_name) AS name, st.nickname, st.phone, st.live_balance AS liveBalance
+        FROM student st WHERE st.id IN (${sql.join(ids.map((i) => sql`${i}`), sql`, `)})`) : [];
+
+    const [counts] = await rows(sql`
+        SELECT SUM(s.status = 'scheduled' AND ${SESSION_DAY} <= CURDATE()) AS held,
+               SUM(s.status = 'scheduled' AND ${SESSION_DAY} > CURDATE()) AS upcoming,
+               SUM(s.status = 'cancelled') AS cancelled
+        FROM sessions s WHERE s.teacher_id = ${teacherId}`);
+    const money = await liveMoney();
+    const charges = await liveCharges(money, teacherId);
+    const att = new Map(attendance.map((a) => [a.studentId, a]));
+    const who = new Map(people.map((p) => [p.id, p]));
+    const per = new Map<string, Record<ChargeRow["kind"], number> & { revenue: number }>();
+    charges.forEach((c) => {
+        const p = per.get(c.studentId) || { bought: 0, gift: 0, free: 0, unpaid: 0, uncharged: 0, revenue: 0 };
+        p[c.kind]++;
+        p.revenue += worth(c, money);
+        per.set(c.studentId, p);
+    });
+
+    // free sessions admin gave on purpose (Students → Give free sessions), with their reasons
+    const grantRows = ids.length ? await rows(sql`
+        SELECT student_id AS studentId, SUM(sessions) AS n, GROUP_CONCAT(DISTINCT reason ORDER BY created_at SEPARATOR ' · ') AS reasons
+        FROM student_free_sessions WHERE student_id IN (${sql.join(ids.map((i) => sql`${i}`), sql`, `)}) GROUP BY student_id`) : [];
+    const grants = new Map(grantRows.map((g) => [g.studentId, { n: num(g.n), reasons: g.reasons ? String(g.reasons) : "" }]));
+
+    const students = audience.map((a) => {
+        const p = per.get(a.studentId) || { bought: 0, gift: 0, free: 0, unpaid: 0, uncharged: 0, revenue: 0 };
+        const m = money.get(a.studentId);
+        const st = who.get(a.studentId);
+        const freeSessions = p.gift + p.free + p.unpaid + p.uncharged;
+        // why sessions were free, most important first
+        const freeWhy = [
+            p.gift && (grants.get(a.studentId)?.n
+                ? `${p.gift} from free sessions admin gave (${grants.get(a.studentId)!.reasons})`
+                : `${p.gift} from balance added without payment`),
+            p.unpaid && `${p.unpaid} attended with no balance left`,
+            p.uncharged && `${p.uncharged} attended but never charged`,
+            p.free && `${p.free} free Re-Explanation`,
+        ].filter(Boolean) as string[];
+        return {
+            id: a.studentId,
+            name: st?.name?.trim() || "Deleted student",
+            nickname: st?.nickname ?? null,
+            phone: st?.phone ?? null,
+            liveBalance: num(st?.liveBalance),
+            booked: num(a.booked),
+            present: num(att.get(a.studentId)?.present),
+            absent: num(att.get(a.studentId)?.absent),
+            lastAttended: att.get(a.studentId)?.lastAttended ?? null,
+            livePaidTotal: Math.round(m?.paid || 0),          // everything he paid for live packages
+            sessionsBought: m?.bought || 0,
+            giftedByPackage: m?.gifted || 0,                   // sessions from 0 EGP packages
+            freeGiven: grants.get(a.studentId)?.n || 0,         // sessions admin gave free on purpose
+            freeGivenReasons: grants.get(a.studentId)?.reasons || "",
+            pricePerSession: m?.price == null ? null : Math.round(m.price * 100) / 100,
+            paidSessions: p.bought,
+            freeSessions,
+            freeWhy,
+            revenue: Math.round(p.revenue),
+            // "Free" = never paid for a live session but still took sessions; "Partly free" = some were free
+            payStatus: !m?.bought ? (freeSessions || p.bought ? "Free" : "Nothing yet") : freeSessions ? "Partly free" : "Paid",
+        };
+    }).sort((x, y) => y.revenue - x.revenue || y.present - x.present || x.name.localeCompare(y.name));
+
+    const summary = {
+        students: students.length,
+        attended: students.filter((s) => s.present > 0).length,
+        revenue: students.reduce((n, s) => n + s.revenue, 0),
+        paidSessions: students.reduce((n, s) => n + s.paidSessions, 0),
+        freeSessions: students.reduce((n, s) => n + s.freeSessions, 0),
+        freeStudents: students.filter((s) => s.payStatus === "Free" || s.payStatus === "Partly free").length,
+        heldSessions: num(counts?.held),
+        upcomingSessions: num(counts?.upcoming),
+        cancelledSessions: num(counts?.cancelled),
+    };
+    const sessionsList = await sessionLines(sql`s.teacher_id = ${teacherId}`, money, charges);
+    const held = sessionsList.filter((x) => x.state === "held");
+    Object.assign(summary, {
+        attendances: held.reduce((n, x) => n + x.present, 0),
+        avgPerSession: (() => { const m = held.filter((x) => x.present + x.absent > 0); return m.length ? Math.round((m.reduce((n, x) => n + x.present, 0) / m.length) * 10) / 10 : null; })(),
+        revenuePerSession: held.length ? Math.round(summary.revenue / held.length) : null,
+        revenuePerStudent: summary.attended ? Math.round(summary.revenue / summary.attended) : null,
+    });
+
     return SuccessResponse(res, {
         teacher,
-        sessions: sessionsList.map((s) => ({ ...s, present: num(s.present), marked: num(s.marked), avgRating: round1(s.avgRating) })),
+        summary,
+        students,
+        sessions: sessionsList,
         reviews: reviews.map((r) => ({ ...r, rating: num(r.rating) })),
+    });
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /admin/reports/sessions?from&to[&teacherId] — every session in the period, all teachers
+// ─────────────────────────────────────────────────────────────────────────────
+export const getSessionsReport = async (req: Request, res: Response) => {
+    const { from, to } = range(req.query);
+    const teacherId = typeof req.query.teacherId === "string" && req.query.teacherId ? req.query.teacherId : null;
+    const money = await liveMoney();
+    const charges = await liveCharges(money, teacherId || undefined);
+    const where = teacherId
+        ? sql`${SESSION_DAY} BETWEEN ${from} AND ${to} AND s.teacher_id = ${teacherId}`
+        : sql`${SESSION_DAY} BETWEEN ${from} AND ${to}`;
+    const list = await sessionLines(where, money, charges);
+    const held = list.filter((x) => x.state === "held");
+    const marked = held.filter((x) => x.present + x.absent > 0);
+    const sum = (k: "present" | "booked" | "revenue" | "freeStudents" | "paidStudents", l = held) => l.reduce((n, x) => n + x[k], 0);
+    return SuccessResponse(res, {
+        from, to,
+        totals: {
+            sessions: list.length, held: held.length,
+            upcoming: list.filter((x) => x.state === "upcoming" || x.state === "today").length,
+            cancelled: list.filter((x) => x.state === "cancelled").length,
+            booked: sum("booked"), present: sum("present"), revenue: sum("revenue"),
+            paidStudents: sum("paidStudents"), freeStudents: sum("freeStudents"),
+            // average over sessions whose attendance was taken (unmarked ones would read as 0)
+            avgPerSession: marked.length ? Math.round((sum("present", marked) / marked.length) * 10) / 10 : null,
+            revenuePerSession: held.length ? Math.round(sum("revenue") / held.length) : null,
+            // attendance taken and nobody was present / attendance never taken
+            emptySessions: held.filter((x) => !x.present && x.absent > 0).length,
+            unmarkedSessions: held.filter((x) => !x.present && !x.absent).length,
+        },
+        sessions: list,
     });
 };
 
@@ -389,6 +685,19 @@ export const getPaymentsReport = async (req: Request, res: Response) => {
 
     const [walletTotal] = await rows(sql`SELECT COALESCE(SUM(balance), 0) AS total, SUM(balance > 0) AS n FROM wallet`);
 
+    // same-length period right before, for growth; plus first-time vs returning payers in the period
+    const prev = previousRange(from, to);
+    const [prevTot] = await rows(sql`
+        SELECT COUNT(*) AS n, COALESCE(SUM(p.amount), 0) AS amount FROM payment p
+        WHERE p.isDeleted = 0 AND p.status = 'completed' AND p.paymentMethodId <> 'wallet00-0000-4000-8000-000000000000'
+          AND p.createdAt BETWEEN ${prev.from + " 00:00:00"} AND ${prev.to + " 23:59:59"}`);
+    const [payers] = await rows(sql`
+        SELECT COUNT(DISTINCT p.studentId) AS payers,
+               COUNT(DISTINCT CASE WHEN NOT EXISTS (SELECT 1 FROM payment p2 WHERE p2.studentId = p.studentId AND p2.status = 'completed'
+                    AND p2.isDeleted = 0 AND p2.createdAt < ${fromTs}) THEN p.studentId END) AS newPayers
+        FROM payment p
+        WHERE ${inRange} AND p.status = 'completed' AND p.studentId IS NOT NULL AND p.paymentMethodId <> 'wallet00-0000-4000-8000-000000000000'`);
+
     const status = (s: string) => byStatus.find((r) => r.status === s);
     return SuccessResponse(res, {
         from, to,
@@ -402,7 +711,11 @@ export const getPaymentsReport = async (req: Request, res: Response) => {
             pendingNowCount: num(pendingAll?.n),
             walletBalances: num(walletTotal?.total),
             walletsWithBalance: num(walletTotal?.n),
+            avgOrder: num(status("completed")?.n) ? Math.round(num(status("completed")?.amount) / num(status("completed")?.n)) : null,
+            payers: num(payers?.payers),
+            newPayers: num(payers?.newPayers),
         },
+        previous: { from: prev.from, to: prev.to, collected: num(prevTot?.amount), collectedCount: num(prevTot?.n) },
         byMethod: byMethod.map((r) => ({ name: r.name, count: num(r.n), amount: num(r.amount) })),
         byPurpose: byPurpose.map((r) => ({ name: r.name, count: num(r.n), amount: num(r.amount) })),
         months,
