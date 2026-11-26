@@ -22,6 +22,7 @@ import sessionRatingRouter from "./SessionRating";
 import extraHomeworkRouter from "./ExtraHomework";
 import availabilityPlanRouter from "./availabilityPlan";
 import notesRouter from "./notes";
+import currencyRouter from "./currency";
 import { authorizeRoles } from "../../middlewares/authorized";
 import { authenticated } from "../../middlewares/authenticated";
 const router = Router()
@@ -48,6 +49,7 @@ router.use("/ideas", ideasRouter)
 router.use("/reports", reportsRouter)
 router.use("/promo-codes", promoCodesRouter)
 router.use("/notes", notesRouter)
+router.use("/currencies", currencyRouter)
 router.use("/notifications", notificationsRouter)
 export default router
 
