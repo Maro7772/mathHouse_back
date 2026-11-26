@@ -1,4 +1,4 @@
-import { mysqlTable, char, timestamp, datetime, int, boolean, mysqlEnum, uniqueIndex } from "drizzle-orm/mysql-core";
+import { mysqlTable, char, timestamp, datetime, int, boolean, mysqlEnum, uniqueIndex, mediumtext } from "drizzle-orm/mysql-core";
 import { sql } from "drizzle-orm";
 import { Student } from "./Student";
 import { Exams, ExamSections } from "./exams";
@@ -13,6 +13,9 @@ export const examAttempts = mysqlTable("exam_attempts", {
     score: int("score"),
     isPassed: boolean("is_passed"),
     status: mysqlEnum("status", ["in_progress", "completed", "timed_out"]).notNull().default("in_progress"),
+    // answers the student picked but has not submitted yet ({ questionId: value } as JSON), saved as they go
+    // so leaving the exam and coming back keeps them
+    draftAnswers: mediumtext("draft_answers"),
     createdAt: timestamp("created_at").defaultNow(),
     updatedAt: timestamp("updated_at").defaultNow().onUpdateNow(),
 });

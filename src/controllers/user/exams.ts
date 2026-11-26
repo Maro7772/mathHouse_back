@@ -150,7 +150,7 @@ export const getExams = async (req: Request, res: Response) => {
 
     // 5. Get attempts for status mapping
     const examIds = exams.map(e => e.id);
-    let attemptsMap = new Map<string, { status: string; score: number | null; isPassed: boolean | null }>();
+    let attemptsMap = new Map<string, { status: string; score: number | null; isPassed: boolean | null; startedAt: Date | null; inProgress: boolean }>();
 
     if (examIds.length > 0) {
         const attempts = await db
@@ -159,6 +159,7 @@ export const getExams = async (req: Request, res: Response) => {
                 status: examAttempts.status,
                 score: examAttempts.score,
                 isPassed: examAttempts.isPassed,
+                startedAt: examAttempts.startedAt,
             })
             .from(examAttempts)
             .where(and(
@@ -168,10 +169,14 @@ export const getExams = async (req: Request, res: Response) => {
             .orderBy(examAttempts.startedAt);
 
         for (const attempt of attempts) {
+            // latest attempt wins; an unfinished one (there is at most one) marks the exam "in progress"
+            const open = attemptsMap.get(attempt.examId)?.inProgress || attempt.status === "in_progress";
             attemptsMap.set(attempt.examId, {
                 status: attempt.status,
                 score: attempt.score,
                 isPassed: attempt.isPassed,
+                startedAt: attempt.startedAt,
+                inProgress: open,
             });
         }
     }
@@ -372,13 +377,59 @@ export const getExamById = async (req: Request, res: Response) => {
         ))
         .orderBy(desc(examAttempts.startedAt));
 
+    // An unfinished attempt also brings back the answers saved so far and where each section stands,
+    // so the student continues where they left off.
+    let resume: { draftAnswers: Record<string, unknown>; sections: { examSectionId: string; status: string }[] } | null = null;
+    if (existingAttempt?.status === "in_progress") {
+        const [draftRow] = await db.select({ draft: examAttempts.draftAnswers }).from(examAttempts).where(eq(examAttempts.id, existingAttempt.id));
+        let draftAnswers: Record<string, unknown> = {};
+        try { draftAnswers = draftRow?.draft ? JSON.parse(draftRow.draft) : {}; } catch { draftAnswers = {}; }
+        const sectionRows = await db
+            .select({ examSectionId: sectionAttempts.examSectionId, status: sectionAttempts.status })
+            .from(sectionAttempts)
+            .where(eq(sectionAttempts.attemptId, existingAttempt.id));
+        resume = { draftAnswers, sections: sectionRows };
+    }
+
     return SuccessResponse(res, {
         exam: {
             ...exam,
             sections: formattedSections,
         },
-        attempt: existingAttempt ?? null,
+        attempt: existingAttempt ? { ...existingAttempt, ...(resume ?? {}) } : null,
     });
+};
+
+// ===================== SAVE DRAFT ANSWERS =====================
+// PUT /exams/:examId/attempts/:attemptId/draft  Body: { answers: { [questionId]: value } }
+// Called as the student answers; nothing is graded here.
+const MAX_DRAFT_BYTES = 200_000;
+export const saveDraftAnswers = async (req: Request, res: Response) => {
+    const studentId = getStudentId(req);
+    const { examId, attemptId } = req.params;
+    const answers = req.body?.answers;
+    if (!answers || typeof answers !== "object" || Array.isArray(answers)) throw new BadRequest("answers must be an object");
+
+    // keep only simple values (an option id, a grid-in text/number, or a small object), up to 500 questions
+    const clean: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(answers).slice(0, 500)) {
+        if (typeof k !== "string" || k.length > 255 || v == null) continue;
+        if (typeof v === "string" ? v.length <= 500 : typeof v === "number" || typeof v === "boolean" || typeof v === "object") clean[k] = v;
+    }
+    const json = JSON.stringify(clean);
+    if (json.length > MAX_DRAFT_BYTES) throw new BadRequest("Too many answers to save");
+
+    const [result] = await db
+        .update(examAttempts)
+        .set({ draftAnswers: json })
+        .where(and(
+            eq(examAttempts.id, attemptId),
+            eq(examAttempts.studentId, studentId),
+            eq(examAttempts.examId, examId),
+            eq(examAttempts.status, "in_progress"),
+        ));
+    if (!Number((result as any)?.affectedRows ?? 0)) throw new NotFound("No active exam attempt found");
+    return SuccessResponse(res, { message: "Answers saved", saved: Object.keys(clean).length });
 };
 
 // ===================== START EXAM =====================

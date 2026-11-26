@@ -331,15 +331,30 @@ export const getStudentSessionRatings = async (req: Request, res: Response) => {
             updatedAt: sessionStudentRatings.updatedAt,
         })
         .from(sessionStudentRatings)
-        .innerJoin(sessions, eq(sessionStudentRatings.sessionId, sessions.id))
+        // left join: a rating stays visible (as "deleted session") even if its session was deleted later
+        .leftJoin(sessions, eq(sessionStudentRatings.sessionId, sessions.id))
         .leftJoin(teachers, eq(sessions.teacherId, teachers.id))
         .where(eq(sessionStudentRatings.studentId, id))
         .orderBy(desc(sessionStudentRatings.createdAt));
+
+    // sessions the student attended (present) but has not rated yet
+    const notRatedRes: any = await db.execute(sql`
+        SELECT s.id AS sessionId, s.name AS sessionName,
+               DATE_FORMAT(COALESCE(s.session_date, s.start_date), '%Y-%m-%d') AS sessionDate,
+               TIME_FORMAT(s.time_from, '%H:%i') AS timeFrom, t.name AS teacherName
+        FROM session_attendance a
+        JOIN sessions s ON s.id = a.session_id
+        LEFT JOIN teachers t ON t.id = s.teacher_id
+        WHERE a.student_id = ${id} AND a.status = 'present' AND s.status <> 'cancelled'
+          AND NOT EXISTS (SELECT 1 FROM session_student_ratings r WHERE r.session_id = s.id AND r.student_id = ${id})
+        ORDER BY COALESCE(s.session_date, s.start_date) DESC, s.time_from DESC`);
+    const notRated = (Array.isArray(notRatedRes) ? notRatedRes[0] : notRatedRes?.rows) ?? [];
 
     if (ratingsList.length === 0) {
         return SuccessResponse(res, {
             message: "No session ratings found for this student",
             data: {
+                notRated,
                 student: {
                     id: student.id,
                     name: `${student.firstname} ${student.lastname}`,
@@ -392,7 +407,8 @@ export const getStudentSessionRatings = async (req: Request, res: Response) => {
     const sessionsFormatted = ratingsList.map(r => ({
         id: r.id,
         sessionId: r.sessionId,
-        sessionName: r.sessionName,
+        sessionName: r.sessionName ?? "(deleted session)",
+        sessionDeleted: r.sessionName == null,
         sessionDate: r.sessionDate,
         teacherName: r.teacherName,
         overallRating: Number(r.overallRating),
@@ -414,6 +430,7 @@ export const getStudentSessionRatings = async (req: Request, res: Response) => {
             averageScore: avgOverall,
             totalSessionsRated: ratingsList.length,
             sessions: sessionsFormatted,
+            notRated,
         }
     });
 };

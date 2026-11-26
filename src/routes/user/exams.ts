@@ -13,8 +13,7 @@ import {
     getExamAttemptsHistory,
     startSection,
     startBreak,
-    submitSection,
-} from "../../controllers/user/exams";
+    submitSection, saveDraftAnswers } from "../../controllers/user/exams";
 
 const router = Router();
 
@@ -33,6 +32,8 @@ router.get("/:examId/attempts/:attemptId/sections/:examSectionId/start", catchAs
 // Start a break after completing a section
 router.get("/:examId/attempts/:attemptId/sections/:examSectionId/break", catchAsync(startBreak));
 // Submit answers for a section and end it
+// Answers picked so far (autosave), so leaving and coming back keeps them
+router.put("/:examId/attempts/:attemptId/draft", catchAsync(saveDraftAnswers));
 router.post("/:examId/attempts/:attemptId/sections/:examSectionId/submit", catchAsync(submitSection));
 
 // ── Reveal question answer (costs questionBalance) ───────────────────────────

@@ -44,6 +44,19 @@ export const selectOptions = async (req: Request, res: Response) => {
 // البحث في الـ Students
 export const searchStudents = async (req: Request, res: Response) => {
     const { q = "", page = 1, limit = 20 } = req.query;
+
+    // ?ids=a,b,c → just those students (pickers use it to show the names of students already selected)
+    if (typeof req.query.ids === "string" && req.query.ids.trim()) {
+        const ids = [...new Set(req.query.ids.split(",").map((x) => x.trim()).filter(Boolean))].slice(0, 200);
+        const picked = ids.length ? await db
+            .select({ id: Student.id, firstname: Student.firstname, lastname: Student.lastname, nickname: Student.nickname, email: Student.email })
+            .from(Student)
+            .where(inArray(Student.id, ids)) : [];
+        return SuccessResponse(res, {
+            data: picked.map((s) => ({ value: s.id, label: `${s.firstname} ${s.lastname}`, nickname: s.nickname, email: s.email })),
+            pagination: { total: picked.length, page: 1, limit: picked.length, totalPages: 1 },
+        });
+    }
     const searchTerm = `%${q}%`;
     const offset = (Number(page) - 1) * Number(limit);
 
